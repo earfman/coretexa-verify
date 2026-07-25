@@ -1,0 +1,100 @@
+name: coretexa-verify
+description: >-
+  Mutation-tests a pull request's own diff: reverts only its source changes and
+  reports whether the PR's new tests actually notice. Runs entirely on your
+  runner.
+author: coretexa
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  base-ref:
+    description: >-
+      Base branch or ref to compare against. Defaults to the pull request's base
+      branch (GITHUB_BASE_REF), so you normally do not set this.
+    required: false
+    default: ""
+  head-ref:
+    description: "Head ref to analyse. Defaults to the checked-out HEAD."
+    required: false
+    default: "HEAD"
+  fail-on:
+    description: >-
+      When to fail the job. One of: never (default, non-blocking), no-gate,
+      no-gate-or-inconclusive, not-gate-holds.
+    required: false
+    default: "never"
+  timeout:
+    description: "Per test-run timeout in seconds."
+    required: false
+    default: "900"
+  localize:
+    description: >-
+      Per-hunk localisation. auto (default) drills into individual hunks only
+      when the whole-PR revert merely broke the build; always drills in every
+      time; never reports only the whole-PR result.
+    required: false
+    default: "auto"
+  github-token:
+    description: >-
+      Token used to post/update a single PR comment. Omit it and no comment is
+      written. Needs `pull-requests: write`.
+    required: false
+    default: ""
+  comment:
+    description: "Set to false to skip the PR comment even when a token is provided."
+    required: false
+    default: "true"
+  working-directory:
+    description: "Repository root to analyse. Defaults to the workspace."
+    required: false
+    default: ""
+  test-globs:
+    description: "Whitespace-separated globs forced to be treated as TEST files."
+    required: false
+    default: ""
+  source-globs:
+    description: "Whitespace-separated globs forced to be treated as SOURCE files."
+    required: false
+    default: ""
+
+outputs:
+  verdict:
+    description: >-
+      One of NO_GATE, GATE_HOLDS, GATE_HOLDS_BUILD, NO_NEW_TESTS, INCONCLUSIVE.
+    value: ${{ steps.verify.outputs.verdict }}
+  details:
+    description: "One-line explanation of the verdict."
+    value: ${{ steps.verify.outputs.details }}
+  json:
+    description: "The full machine-readable report as compact JSON."
+    value: ${{ steps.verify.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - id: verify
+      shell: bash
+      working-directory: ${{ inputs.working-directory || github.workspace }}
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_HEAD_REF: ${{ inputs.head-ref }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_LOCALIZE: ${{ inputs.localize }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_TEST_GLOBS: ${{ inputs.test-globs }}
+        INPUT_SOURCE_GLOBS: ${{ inputs.source-globs }}
+      run: |
+        set -euo pipefail
+        # coretexa-verify is pure standard library, so there is nothing to install.
+        # It deliberately uses the interpreter already on PATH, which is the one
+        # your workflow set up and installed the project's test dependencies into.
+        PY="${CORETEXA_PYTHON:-python3}"
+        "$PY" -c 'import sys; assert sys.version_info >= (3, 9), sys.version' \
+          || { echo "::error::coretexa-verify needs Python 3.9+ on PATH"; exit 1; }
+        "$PY" -m coretexa_verify.action_main
