@@ -1,0 +1,30 @@
+# Paste this into .github/workflows/coretexa-verify.yml
+name: coretexa-verify
+
+on: pull_request
+
+permissions:
+  contents: read
+  pull-requests: write   # only needed for the PR comment
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # required: we need the merge base
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Install YOUR project's test dependencies exactly as your CI does.
+      # coretexa-verify runs your tests with the interpreter on PATH; it has
+      # no dependencies of its own.
+      - run: pip install -e ".[dev]"
+
+      - uses: earfman/coretexa-verify@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # fail-on: no-gate     # uncomment to make NO_GATE block the merge
