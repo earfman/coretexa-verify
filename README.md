@@ -253,17 +253,110 @@ Detection is a small registry keyed on repository markers. Adding a language is
 one detector function plus one entry in `REGISTRY`. The chosen command and the
 reason for choosing it are always printed.
 
-| marker | runner |
-|---|---|
-| `uv.lock` + `uv` on PATH | `uv run --frozen pytest` |
-| `.venv/bin/python` | `.venv/bin/python -m pytest` |
-| `pyproject.toml`, `setup.py`, `setup.cfg`, `tox.ini`, `pytest.ini`, `conftest.py` | `python -m pytest` |
-| `package.json` naming `vitest` | `npx vitest run` |
-| `package.json` naming `jest` | `npx jest` |
-| `package.json` with some other `scripts.test` | `npm test` (exit-code-only; the reduced confidence is stated in the report) |
+Detectors are tried in this order, and the first match wins:
+
+| # | marker | runner |
+|---|---|---|
+| 1 | `uv.lock` + `uv` on PATH | `uv run --frozen pytest` |
+| 1 | `.venv/bin/python` | `.venv/bin/python -m pytest` |
+| 1 | `pyproject.toml`, `setup.py`, `setup.cfg`, `tox.ini`, `pytest.ini`, `conftest.py` | `python -m pytest` |
+| 2 | `package.json` naming `vitest` | `npx vitest run` |
+| 2 | `package.json` naming `jest` | `npx jest` |
+| 2 | `package.json` with some other `scripts.test` | `npm test` (exit-code-only; the reduced confidence is stated in the report) |
+| 3 | `go.mod` | `go test -json` |
+| 4 | `Cargo.toml` | `cargo test --no-fail-fast` |
+| 5 | `pom.xml` | `mvn test -Dtest=<classes>` **(experimental)** |
+| 5 | `build.gradle`, `build.gradle.kts` | `./gradlew test --tests <patterns>` **(experimental)** |
+
+Order is policy, not accident. A polyglot repository is usually an interpreted
+project with a compiled extension inside it — sqlfluff is a Python package that
+vendors a Rust crate — and in that shape the tests that matter are the Python
+ones. Java is last because `pom.xml` turns up in repositories that are only
+incidentally JVM projects.
+
+Each runner also declares which file extensions it can actually execute, and
+selection is filtered through that list. Without it, sqlfluff's genuine
+`sqlfluffrs/tests/fixture_tests.rs` gets offered to pytest, collection returns
+nothing, and a real `GATE_HOLDS` degrades to `INCONCLUSIVE`.
 
 If detection fails, the verdict is `INCONCLUSIVE` with the reason. We never guess
 a command.
+
+#### Go
+
+* **Command.** `go test -json` on the package(s) owning the changed test files,
+  narrowed with `-run '^(TestA|TestB)$'` to the top-level `func Test…` the diff
+  touched. `-run` is only applied when *every* target is narrowed, because it
+  applies to every package on the command line.
+* **Results.** The JSON event stream. `Action=pass|fail|skip` **with** a `Test`
+  field is a test; a terminal `fail` **without** one is a package that never
+  compiled, which is `GATE_HOLDS_BUILD`. Plain-text `[build failed]` output from
+  older toolchains is classified the same way. Skips are excluded from the
+  executed count exactly as pytest skips are.
+* **Fixtures.** `pkg/testdata/…` is mapped to `pkg`'s tests as *proof*, not a
+  guess: `go help test` makes `testdata/` invisible to the build and reserved
+  for its parent package's tests, and `go test` runs each binary with the
+  package directory as its working directory.
+* **Install.** `go mod download`, falling back to the same command under
+  `GOFLAGS=-mod=mod` when a committed `go.sum` is incomplete.
+* **Toolchain.** A `go`/`toolchain` directive newer than the installed
+  toolchain is reported with both versions. Under `GOTOOLCHAIN=local` that is a
+  loud warning and the run ends `INCONCLUSIVE`; otherwise the go command
+  downloads the pinned toolchain itself and we say so.
+
+#### Rust
+
+* **Command.** `cargo test --no-fail-fast -p <crate>`, where the crate is the
+  nearest owning `Cargo.toml` — so a workspace member is addressed the same way
+  as a single crate. A changed `tests/foo.rs` becomes `--test foo`.
+* **Results.** libtest's stable text output (`test a::b ... ok` and
+  `test result: ok. X passed; Y failed; Z ignored`). Nightly JSON is not
+  required. `cargo-nextest` is preferred when installed, but the text parser is
+  the default and the one under test.
+* **Compile errors.** `error[E0599]` before any `test result:` line is
+  `BUILD_ERROR`, which is what makes `GATE_HOLDS_BUILD` meaningful for a
+  compiled language. Cargo's own `error: could not compile … due to N previous
+  errors` summary is excluded from the count, so the number in the report is the
+  number of real diagnostics.
+* **`#[ignore]` is a skip**, so it never contributes to the executed count.
+* **Timeouts.** Compiling is the job. The default per-run timeout is 900s and is
+  stated in the report; a `TIMEOUT` is always `INCONCLUSIVE`, never a finding.
+* **Install.** `cargo fetch`.
+
+#### Tests that live inside source files
+
+Rust breaks the assumption every other language here satisfies: that a file is
+either the code under test or the test. The idiomatic Rust unit test is a
+`#[cfg(test)] mod tests` block at the bottom of the very file it tests. Both
+Rust pull requests this release was validated against are that shape.
+
+Reverting such a file wholesale deletes the PR's own evidence; refusing to
+revert it means never running the experiment. So the cut moves *inside* the
+file. `coretexa_verify.inline_tests` finds the head-side line ranges holding
+test code — with a real Rust scanner, because block comments nest, raw strings
+have no escapes, and `'a` is a lifetime while `'a'` is a character literal — and
+the revert is then done per hunk against a zero-context diff:
+
+* a hunk outside every test region is rolled back to base;
+* a hunk inside one is left at head;
+* a hunk that *straddles* a boundary is left at head and reported, because we
+  cannot say which base lines belong to which half and guessing would delete a
+  test;
+* if nothing outside the test regions can be reverted, no revert is claimed and
+  the verdict is `INCONCLUSIVE`.
+
+The result is the base implementation carrying the PR's new tests. Localisation
+applies the same filter, so a per-hunk revert can never delete a test either.
+Such a file appears in *both* halves of the report — it is a source file we
+revert and a test file we run — which is the honest description of it.
+
+#### Java (experimental)
+
+Command construction and JUnit XML reading are unit-tested against canned
+output, and the XML reader is literally the one pytest uses, `<failure>` versus
+`<error>` split included. What has **not** happened is an end-to-end validation
+against a real JVM pull request. Treat a Java verdict accordingly; the runner
+says so in its own warnings, in every report it produces.
 
 ### Dependency install
 
@@ -350,6 +443,24 @@ our mutation, whether or not your repo gitignores them. The policy:
 4. **We never revert, clean or delete an artefact.** It was not ours to create.
    We list what appeared and leave it exactly there.
 
+For a compiled language the same question has a different answer, and it is
+worth stating rather than assuming. `go test` and `cargo test` **are** the
+build: each compiles the package or crate from source on every invocation, keyed
+by a content hash (Go) or a fingerprint including each source file (Cargo), so a
+reverted file is recompiled before the test binary is linked. There is no
+artefact directory a test could read instead — Go has no `dist/`, and `build.rs`
+output, `include_str!` data and `CARGO_BIN_EXE_*` binaries are all regenerated
+by that same invocation. `mvn test` and `gradle test` do have a separate compile
+step, but their test goal already depends on it. So all four compiled runners
+report "no build step" and "no artefact risk", and both are claims about the
+toolchain rather than gaps in the analysis.
+
+JavaScript is the one language here that genuinely needs the build re-run:
+`dist/` outlives the source it was built from. `verify.py` therefore asks the
+*runner* for a build step rather than switching on a language name, so every
+"no build step" in a report is traceable to a runner that made that claim about
+its own toolchain.
+
 Bytecode caches get the same treatment, and it matters more than it sounds:
 CPython validates a `.pyc` on the source file's mtime and size alone, and
 reverting a hunk very often leaves the byte count unchanged (`return 1` for
@@ -363,8 +474,12 @@ already lying around — can ever answer for the source.
 
 Configurable, with defaults that work: paths containing `test/`, `tests/`,
 `spec/`, `__tests__/`, `unit_tests/`, `*testsuite/`; files matching `test_*.py`,
-`*_test.py`, `*Test.py`, `conftest.py`, `*.test.[jt]sx?`, `*.spec.[jt]sx?`.
-Fixture and snapshot data under a test directory counts as `TEST`.
+`*_test.py`, `*Test.py`, `conftest.py`, `*.test.[jt]sx?`, `*.spec.[jt]sx?`,
+`*_test.go`, `*Test.java`, `*Tests.java`, `*IT.java`, `*Test.kt`. A `.rs` file
+sitting *directly* in a crate's `tests/` directory is an integration test —
+nested ones such as `tests/common/mod.rs` are shared modules, not cargo targets,
+and are deliberately not offered to `--test`. Fixture and snapshot data under a
+test directory counts as `TEST`.
 
 The separator requirement means `latest/` and `contest/` are *not* mistaken for
 test directories.
