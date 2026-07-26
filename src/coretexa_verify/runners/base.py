@@ -75,6 +75,9 @@ class Runner:
         #: Set by :func:`coretexa_verify.verify` when a build step is detected.
         self.build_step: "BuildStep | None" = None
         self.build_info: BuildInfo | None = None
+        #: Warnings a detector wants surfaced in the report - things the user
+        #: needs to know about the environment we are about to run in.
+        self.setup_warnings: list[str] = []
 
     # -- environment -------------------------------------------------------
     @property

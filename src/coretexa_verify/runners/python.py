@@ -242,9 +242,25 @@ def detect_python(ctx: DetectionContext, extra_args=None) -> PytestRunner | None
                 extra_args=extra_args,
             )
 
-    return PytestRunner(
+    # Last resort: the interpreter coretexa-verify itself is running in. That is
+    # a real decision with a real consequence - the repository's test
+    # dependencies get installed into *our* environment - so it is named in the
+    # reason string and warned about loudly rather than printed as the
+    # comfortable-looking `python -m pytest`.
+    runner = PytestRunner(
         ctx.repo,
-        reason=f"found {marker_note} -> `python -m pytest`",
+        reason=(
+            f"found {marker_note}, and the repository has no uv.lock, .venv or venv, so the "
+            f"interpreter running coretexa-verify was used -> `{sys.executable} -m pytest`"
+        ),
         launcher=[sys.executable, "-m", "pytest"],
         extra_args=extra_args,
     )
+    runner.setup_warnings.append(
+        f"no repository-local environment was found (.venv, venv or uv.lock), so the tests run "
+        f"under {sys.executable} - the interpreter coretexa-verify itself is installed in - and "
+        f"the dependency install writes the repository's test dependencies into that same "
+        f"environment. Create a repo-local .venv (python -m venv .venv) to keep the target "
+        f"repository's dependencies out of the tool's own environment, or pass --no-install-deps."
+    )
+    return runner
