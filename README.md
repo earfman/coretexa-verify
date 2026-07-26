@@ -244,6 +244,21 @@ Hunks that only touch comments, docstrings or formatting are excluded — proven
 inert by comparing docstring-stripped ASTs, not by a regex — because reverting
 them proves nothing.
 
+Two more classes of hunk are excluded, for the same reason and with the same
+bias (an exclusion can only hide a finding, never manufacture one):
+
+- **Identifier renames.** A hunk whose entire change is a consistent token
+  substitution cannot change behaviour. It is not evaluated on its own; instead
+  its `{old: new}` map is kept applied when a *sibling* hunk in the same file is
+  reverted, so the reverted file still compiles and the tests can express an
+  opinion about the behaviour rather than about a missing symbol. Where that
+  rewrite would collide with a symbol the reverted text already uses, the rename
+  is reverted together with its dependants and the result is reported as gating
+  that coupled group.
+- **Hunks the runner cannot reach.** A `.vue` component or a `go.sum` entry is
+  not something any `go test` can observe. These get the status `unreachable`,
+  are never run, and are reported separately from the behavioural count.
+
 `--localize always` runs this even when the gate holds; `--localize never`
 reports only the whole-PR result.
 
@@ -279,8 +294,31 @@ selection is filtered through that list. Without it, sqlfluff's genuine
 `sqlfluffrs/tests/fixture_tests.rs` gets offered to pytest, collection returns
 nothing, and a real `GATE_HOLDS` degrades to `INCONCLUSIVE`.
 
-If detection fails, the verdict is `INCONCLUSIVE` with the reason. We never guess
-a command.
+If detection fails, the verdict is `INCONCLUSIVE` and the reason names every
+marker that was looked for. We never guess a command — but you can supply one:
+
+```bash
+python -m coretexa_verify --repo . --base origin/main \
+  --test-command 'make check' --junit-path build/test-results
+```
+
+`--test-command` (Action input `test-command`) **replaces detection entirely**:
+no detector runs and nothing about the repository's layout is assumed. It runs
+from the repository root. Shell syntax goes through `/bin/sh -c`, anything
+simpler runs as argv, and the PR's selected test targets are substituted for
+`{targets}` if the command contains it, or appended otherwise.
+
+Results are read one of two ways, and the report always says which:
+
+| mode | when | precision |
+|---|---|---|
+| JUnit | `--junit-path` names a file or directory of JUnit XML the command writes | per-test counts, failing names, and the assertion-vs-error split — exactly as precise as a detected runner |
+| exit code | no `--junit-path` | 0 = pass; non-zero is assert-vs-build by a **declared regex heuristic** over the output, and the pattern that decided it is printed in every run's `note` |
+
+A custom command cannot be asked what it *would* run, so selection refinement,
+the collected-test cap and the pre-existing-failure exclusion all switch off
+rather than guess, and no build step is re-run around the mutation. Each of
+those is stated in the report's warnings.
 
 #### Go
 
@@ -478,7 +516,7 @@ Configurable, with defaults that work: paths containing `test/`, `tests/`,
 `*_test.go`, `*Test.java`, `*Tests.java`, `*IT.java`, `*Test.kt`. A `.rs` file
 sitting *directly* in a crate's `tests/` directory is an integration test —
 nested ones such as `tests/common/mod.rs` are shared modules, not cargo targets,
-and are deliberately not offered to `--test`. Fixture and snapshot data under a
+and are deliberately not offered to `cargo test --test`. Fixture and snapshot data under a
 test directory counts as `TEST`.
 
 The separator requirement means `latest/` and `contest/` are *not* mistaken for
@@ -645,8 +683,11 @@ still read as `GATE_HOLDS`.
 - Tests that do not pass at head in the CI environment: flaky, network-dependent,
   or requiring services the workflow did not start. **This is the most common
   cause by far.**
-- No runner detected: Go, Rust, Java, C++, Ruby, .NET — anything outside
-  pytest/jest/vitest today.
+- No runner detected. Five toolchains are recognised — pytest, jest/vitest/npm,
+  `go test`, `cargo test` and Maven/Gradle (experimental). Anything else (C/C++,
+  Ruby, .NET, a Makefile, Bazel) needs `--test-command` / the `test-command`
+  Action input, which replaces detection entirely; without one the answer is
+  `INCONCLUSIVE` and the error names the markers it looked for.
 - A changed fixture that cannot be mapped to a consumer and has no enclosing test
   directory.
 - A changed fixture whose mapping to a consuming test could not be *proven* —
@@ -667,6 +708,84 @@ still read as `GATE_HOLDS`.
 - A shallow clone with no merge base (use `fetch-depth: 0`).
 
 ## Known issues
+
+### Fixed in 1.3.1
+
+The 1.3.0 field test surfaced three defects, all of them about *what gets
+counted*, and all three are now closed.
+
+**A rename coupled to a behaviour change looked like a build-only gate —
+fixed.** On [gatus#1719](https://github.com/TwiN/gatus/pull/1719) hunk 1 renames
+`ErrNoEndpointOrSuiteInConfig` to `ErrNoEndpointOrSuiteOrRemoteInConfig` and
+hunk 2 both changes the validation condition *and* uses the renamed symbol.
+Reverting either hunk alone leaves a dangling identifier, so both came back
+`BUILD_ERROR` and 1.3.0 concluded "the tests gate the presence of the new code,
+not its behaviour". They gate its behaviour: keep the rename and revert only the
+condition and `TestParseAndValidateOnlyRemote` fails an assertion.
+
+Localisation now detects a hunk whose entire change is a consistent identifier
+substitution (string and comment content masked, since a rename drags its own
+error message along). Such a hunk is *inert* — reverting a rename cannot change
+behaviour — and its `{old: new}` map is re-applied to the base lines spliced in
+when any sibling hunk in the same file is reverted, so the file still compiles.
+Where the rewrite would merge two distinct symbols, the rename is reverted
+*with* its dependants as one group and the headline says so rather than
+claiming presence-only. gatus#1719 on 1.3.1:
+
+```
+[ok] GATE_HOLDS
+Every one of the 1 evaluated behavioural change(s) in this PR is detected by
+its own tests (1 by an assertion, 0 at import time). 1 of them had to be
+reverted with the identifier rename(s) ErrNoEndpointOrSuiteInConfig ->
+ErrNoEndpointOrSuiteOrRemoteInConfig kept applied so the file still compiled.
+```
+
+**A head failure that pre-dates the PR blocked every verdict — fixed.**
+superfile [#1519](https://github.com/yorukot/superfile/pull/1519) and
+[#1560](https://github.com/yorukot/superfile/pull/1560) both stopped at "the
+PR's tests do not pass at head". The failing test was `TestZoxide`, which fails
+identically on a clean `origin/main` because the machine has no `zoxide` binary.
+
+When the head run fails, the failing ids are now re-run with **source and tests
+both at the merge base**, and sorted three ways:
+
+- failing at base too → pre-existing. Excluded from the gate set, reported as
+  `pre-existing failures (N), excluded`, and the experiment proceeds on what is
+  left (subject to the usual "something must actually have executed" rule).
+- passing at base → this PR broke it. Still `INCONCLUSIVE`, now with the cause.
+- absent at base → the PR's *own new tests* are the ones failing. Still
+  `INCONCLUSIVE`, and that is a finding about the PR rather than a limitation
+  of ours — superfile [#1534](https://github.com/yorukot/superfile/pull/1534),
+  whose new SSH tests are genuinely flaky, still stops here and says why.
+
+**Unreachable hunks diluted `NO_GATE` headlines — fixed.**
+[gatus#1725](https://github.com/TwiN/gatus/pull/1725) reported "19 of 34
+behavioural changes", but 17 of the 34 were `.vue`, `.html`, `.json` and bundled
+frontend JS. No `go test` executes a Vue component, so those hunks were never
+candidates for a gate.
+
+A runner may now declare which file extensions its tests can observe (only the
+Go runner does; a Python suite genuinely does execute `.sql` fixtures and render
+`.html` templates, so it declares nothing and behaves exactly as before), and
+dependency manifests and lock files — `go.mod`, `go.sum`, `*.lock`,
+`package-lock.json` — are unreachable for every runner. Files under `testdata/`
+and `resources/` stay reachable whatever their extension, because tests open
+them by path. Unreachable hunks get the new per-hunk status `unreachable`
+(`outcome: NOT_RUN` in the JSON, additive), are never reverted, never counted,
+and always listed. gatus#1725 on 1.3.1:
+
+```
+[!!] NO_GATE
+2 of 17 evaluated behavioural change(s) in this PR can be reverted with all 63
+of its tests still passing: config/config.go hunk 1 (head lines 341-350);
+security/oidc.go hunk 6 (head lines 132-149). This PR's tests would pass
+without that change. 17 further change(s) are outside the reach of the detected
+test runner (frontend assets (.html, .js, .json, .vue)) and were not evaluated.
+```
+
+Excluding a hunk can only ever remove a `NO_GATE` finding, never invent one, so
+all three exclusions take the same direction as the existing inertness rule —
+and every excluded hunk is printed in the report so the choice is auditable.
 
 ### Fixed in 1.2.0
 
@@ -752,9 +871,22 @@ These are real and they remain.
   makes this fail *informatively* — both attempts are in the report — but it does
   not make the tests runnable. Add an `apt-get` step.
 - **conda / mamba environments** are not detected at all. Use `install-command`.
-- **Languages other than Python and JavaScript/TypeScript.** Go, Rust, Java, C++,
-  Ruby and .NET produce `INCONCLUSIVE` — no runner is detected. Adding one is a
-  detector function plus a registry entry.
+- **Languages with no detector.** Five are detected: Python (pytest),
+  JavaScript/TypeScript (jest, vitest, `npm test`), Go (`go test -json`), Rust
+  (`cargo test`) and the JVM (Maven/Gradle, **experimental** — see below).
+  Anything else — C/C++, Ruby, .NET, Bazel, a bare Makefile — is reached with
+  `--test-command`, which overrides detection entirely. That path classifies
+  results from the exit code with a declared heuristic unless the command writes
+  JUnit XML at `--junit-path`, in which case it is as precise as a detected
+  runner. Adding a real detector is still one function plus a registry entry.
+- **The JVM runner is experimental.** Maven and Gradle are detected and their
+  Surefire/Gradle JUnit XML is read, but far fewer real pull requests have been
+  put through it than through the other four. Treat its verdicts as indicative.
+- **A custom `--test-command` has no build step and cannot enumerate.** We do not
+  know how to ask an arbitrary command what it would run, so selection refinement,
+  the collected-test cap and the pre-existing-failure exclusion all switch off
+  rather than guess, and no build is re-run around the mutation. All of this is
+  said in the report's warnings.
 - **Build artefacts beyond what we re-run.** We re-run a *detected* build step
   around every mutation, and we refuse `NO_GATE` when the selected tests import
   build output and no build step was found. Two gaps remain: a build produced by
@@ -845,6 +977,115 @@ so and the verdict is `INCONCLUSIVE` rather than wrong — but you will want
 
 ---
 
+## Security
+
+This Action runs a pull request's own test suite, its own build step and its own
+dependency installer. All three are code the PR author wrote. Treat it exactly as
+you would any other workflow that executes untrusted code.
+
+### Token isolation
+
+Since 1.3.2, **no credential in the job's environment is passed to any
+subprocess that runs repository-controlled code.** Before the installer, the
+build step, the test runs and the collection pass are launched, the environment
+is copied and every credential-shaped variable is removed:
+
+- by exact name: `INPUT_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`,
+  `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN`,
+  `AWS_SECRET_ACCESS_KEY`, `NPM_TOKEN`, `NODE_AUTH_TOKEN`, `PGPASSWORD`,
+  `SSH_AUTH_SOCK` and friends;
+- by shape: any name ending in `TOKEN`, `SECRET`, `PASSWORD`, `PASSPHRASE`,
+  `CREDENTIAL(S)`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`, `AUTH` or `PAT` at a
+  word boundary (so `MY_SERVICE_TOKEN` goes, `TOKEN_URL` stays).
+
+Everything else is preserved, because a test suite legitimately needs `PATH`,
+`HOME`, `LANG` and its language's caches. The report prints how many variables
+were withheld and their **names only** — never a value.
+
+git is deliberately *not* isolated: it is our own code and may need the job's
+credentials to fetch a base ref from a private repository. The comment token is
+read once, in our own process, after the experiment has finished.
+
+If a test genuinely needs one of these variables — an integration test against a
+real service — name it explicitly:
+
+```yaml
+env:
+  CORETEXA_VERIFY_ALLOW_ENV: MY_SERVICE_TOKEN,OTHER_TOKEN
+```
+
+This is per-name and opt-in. There is no switch that disables isolation wholesale.
+
+### Least-privilege permissions
+
+The Action needs nothing beyond reading the code it is analysing. Give it only
+that, and only add `pull-requests: write` if you want the PR comment:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write   # only if you pass github-token; omit otherwise
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: earfman/coretexa-verify@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+**With no `github-token` the Action posts nothing.** The verdict goes to the job
+summary and the step outputs, which need no permissions at all. That is the
+recommended configuration for public repositories taking pull requests from
+forks:
+
+```yaml
+permissions:
+  contents: read
+```
+
+### Never use `pull_request_target` to check out PR code
+
+> **Warning**
+> Do not run this Action on a `pull_request_target` event with the pull
+> request's own code checked out.
+
+`pull_request_target` runs with a **read-write token and access to repository
+secrets**, in the context of the base repository. Checking out the PR's head in
+that context and then executing it — which is precisely what this Action does —
+hands a fork's author your secrets. That is true of any workflow that builds or
+tests PR code under `pull_request_target`; this Action's token isolation reduces
+the blast radius but cannot fix a workflow that is unsafe by construction.
+
+Use the ordinary `pull_request` event, which runs with a read-only token and no
+secrets for fork PRs:
+
+```yaml
+on:
+  pull_request:
+```
+
+If you need the comment on fork PRs, run the analysis on `pull_request`, upload
+the JSON output as an artifact, and post it from a separate
+`workflow_run`-triggered workflow that never checks out the PR's code.
+
+### What this Action does not do
+
+- No telemetry. It talks to no network service except the GitHub API, and only
+  when you hand it a token.
+- It runs entirely on your runner. Nothing is uploaded anywhere.
+- It never writes outside the repository except to a temporary report directory,
+  and it restores the working tree in a `finally`.
+
+Report a security issue by opening an issue at
+<https://github.com/earfman/coretexa-verify/issues>. See [SECURITY.md](SECURITY.md).
+
+---
+
 ## Safety
 
 - The working tree is restored in a `finally`, by copying back the exact bytes we
@@ -867,7 +1108,7 @@ so and the verdict is `INCONCLUSIVE` rather than wrong — but you will want
 ```bash
 git clone https://github.com/earfman/coretexa-verify
 cd coretexa-verify
-PYTHONPATH=src python -m pytest tests -q     # 177 tests, no network required
+PYTHONPATH=src python -m pytest tests -q     # 504 tests, no network required
 ```
 
 Layout:
@@ -880,7 +1121,10 @@ src/coretexa_verify/
   hunks.py       unified-diff surgery and the behavioural-inertness rule
   gitops.py      timeout-bounded git, revert/restore, and tree snapshots
   deps.py        test-dependency detection and the install it runs
-  runners/       the detection registry: python.py, javascript.py
+  runners/       the detection registry and one module per toolchain:
+                   python.py, javascript.py, golang.py, rust.py, java.py,
+                   plus custom.py (an explicit --test-command) and
+                   junit.py (shared JUnit XML reading)
   verify.py      the experiment and the verdict logic
   report.py      terminal, Markdown and JSON rendering
   cli.py         command line

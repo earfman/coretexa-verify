@@ -50,6 +50,25 @@ inputs:
     description: "Timeout in seconds for each dependency-install command."
     required: false
     default: "600"
+  test-command:
+    description: >-
+      Explicit test command. Overrides runner detection entirely and runs from
+      the repository root. Use this for a toolchain the detectors do not cover -
+      a Makefile target, a Bazel invocation, a shell script. Shell syntax
+      (&&, pipes, globs) goes through `/bin/sh -c`; anything simpler runs as
+      argv. The selected test targets replace `{targets}` if the command
+      contains it, and are appended otherwise.
+    required: false
+    default: ""
+  junit-path:
+    description: >-
+      File or directory of JUnit XML that `test-command` writes. With it, per-
+      test counts and the assertion-vs-build distinction are read from the
+      report and are exactly as precise as for a detected runner. Without it,
+      results are classified from the exit code alone using a declared text
+      heuristic that is printed with every run.
+    required: false
+    default: ""
   max-collected:
     description: "Refuse to run when a widened selection collects more than this many tests."
     required: false
@@ -113,6 +132,8 @@ runs:
         INPUT_INSTALL_DEPS: ${{ inputs.install-deps }}
         INPUT_INSTALL_COMMAND: ${{ inputs.install-command }}
         INPUT_INSTALL_TIMEOUT: ${{ inputs.install-timeout }}
+        INPUT_TEST_COMMAND: ${{ inputs.test-command }}
+        INPUT_JUNIT_PATH: ${{ inputs.junit-path }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
