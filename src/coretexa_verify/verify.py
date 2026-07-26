@@ -66,7 +66,7 @@ from .models import (
 from .runners import CommandRunner, DetectionFailed, Runner, detect_runner
 from .selection import classify_all, select_targets
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 #: Reason attached to a verdict that had to be downgraded because a changed
 #: fixture could not be tied to a test that reads it. Quoted in the README.
@@ -156,6 +156,13 @@ def verify(opts: VerifyOptions) -> Report:
             + (f" (+{len(dirty) - 5} more)" if len(dirty) > 5 else ""),
         )
 
+    # The tree is clean here, so anything tracked that is dirty when we are
+    # done was dirtied by us - almost always a lockfile the build tool
+    # regenerates (`go.work.sum`, `go.sum`, `Cargo.lock`). Leaving it behind
+    # makes the *next* run on the same checkout fail the guard above, which is
+    # how a local scouting sweep degrades to INCONCLUSIVE after the first PR.
+    clean_baseline = gitops.TreeState.capture(repo)
+
     original_ref = gitops.current_ref(repo)
     needs_checkout = gitops.rev_parse(repo, "HEAD") != head_sha
     if needs_checkout and not opts.allow_checkout:
@@ -178,6 +185,38 @@ def verify(opts: VerifyOptions) -> Report:
                 report.warnings.append(
                     f"could not return the checkout to {original_ref}: {restore.stderr.strip()}"
                 )
+        _restore_files_we_dirtied(repo, clean_baseline, report)
+
+
+def _restore_files_we_dirtied(
+    repo: str, baseline: "gitops.TreeState", report: Report
+) -> None:
+    """Put back tracked files that our own test runs modified.
+
+    The precondition guard has already established that the tree was clean, so
+    every tracked file that is dirty now is dirt we made: `go test` rewriting
+    `go.work.sum`, cargo touching `Cargo.lock`, a build regenerating a version
+    stamp. We restore those and say so, rather than either leaving the guard to
+    trip on the next run or - much worse - relaxing the guard so that a user's
+    real uncommitted work could be clobbered.
+    """
+    try:
+        after = gitops.TreeState.capture(repo)
+    except gitops.GitError:  # pragma: no cover - defensive
+        return
+    ours = after.new_tracked_since(baseline)
+    if not ours:
+        return
+    failed = []
+    for path in ours:
+        res = gitops.git(repo, "checkout", "--", path)
+        if res.returncode != 0:
+            failed.append(path)
+    if failed:
+        report.tree_restored = False
+        report.warnings.append(
+            "could not restore " + ", ".join(failed) + " after the test run"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1178,8 +1217,9 @@ def _install_dependencies(
         rep.notes.append(
             "the dependency install modified tracked file(s) "
             + ", ".join(rep.dirtied_tracked[:5])
-            + "; they were left exactly as the install left them and excluded from the "
-            "restoration check, so they can never be mistaken for this tool's own mutation"
+            + "; they were left exactly as the install left them for the duration of the "
+            "run and excluded from the restoration check, so they can never be mistaken "
+            "for this tool's own mutation, then restored at the end"
         )
         report.warnings.append(rep.notes[-1])
     if rep.artefacts:
