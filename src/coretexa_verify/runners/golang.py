@@ -271,6 +271,17 @@ class GoTestRunner(Runner):
     id = "go-test"
     language = "go"
     test_file_extensions = (".go",)
+    #: `go test` compiles and runs Go. It cannot execute a Vue component, a
+    #: stylesheet, a web-app manifest or a bundled JS asset, so a change to one
+    #: is outside the reach of anything this runner can run. Files under
+    #: ``testdata/`` stay reachable whatever their extension - the base class
+    #: handles that - because Go tests open them by path.
+    #:
+    #: Note the deliberate omission: a file may be pulled into the binary by
+    #: ``//go:embed`` and still be listed unreachable here. That is the safe
+    #: direction. Excluding a hunk can only remove a NO_GATE finding, never
+    #: invent one, and every excluded hunk is printed in the report.
+    source_file_extensions = (".go",)
     #: go test writes nothing to a file; results are the JSON event stream.
     report_suffix = "jsonl"
 
@@ -417,6 +428,7 @@ class GoTestRunner(Runner):
                 cwd=cwd,
                 timeout=timeout,
                 env=self.subprocess_env(),
+                isolate=True,
             )
             if res.timed_out or res.returncode != 0:
                 return None
@@ -430,6 +442,47 @@ class GoTestRunner(Runner):
                 if nid not in ids:
                     ids.append(nid)
         return ids
+
+    # -- re-running a subset ----------------------------------------------
+    def rerun_targets(self, failing_ids: list[str], current_targets: list[str]) -> list[str] | None:
+        """Re-run just these tests, in the packages we are already running.
+
+        A Go failing id names the package by *import path*
+        (``github.com/x/y/internal::TestZoxide``) while a target names it by
+        directory relative to the module root (``./internal``). The two cannot
+        be compared, so the package side is taken from the targets we already
+        have and only the test names come from the failures.
+
+        Subtest paths are cut back to their top-level test: ``go test -run``
+        splits its pattern on ``/`` and matches one component per nesting
+        level, so handing it ``^(TestX/case)$`` would not be the regex it looks
+        like. Running the parent re-runs the subtest anyway.
+        """
+        names: list[str] = []
+        for ident in failing_ids:
+            name = self.test_key(ident)
+            if name and name not in names:
+                names.append(name)
+        packages: list[str] = []
+        for target in current_targets:
+            pkg, _ = self._split(target)
+            if pkg and pkg not in packages:
+                packages.append(pkg)
+        if not names or not packages:
+            return None
+        return [f"{pkg}::{name}" for pkg in packages for name in names]
+
+    def test_key(self, ident: str) -> str:
+        """Top-level test name, package and subtest path dropped.
+
+        The package has to go because a failure and a collection spell it
+        differently (import path vs. ``./dir``); the subtest path has to go
+        because ``-run`` cannot address one directly. The cost is that two
+        packages in the same run sharing a test name are treated as one test,
+        which over-excludes rather than under-excludes.
+        """
+        name = ident.partition("::")[2] or ident
+        return name.split("/")[0].strip()
 
     # -- narrowing ---------------------------------------------------------
     def narrow_from_diff(self, repo, base_sha, head_sha, path, targets):
@@ -566,5 +619,5 @@ def detect_go(ctx: DetectionContext, extra_args=None) -> Runner | None:
 
 
 def _go_version() -> str:
-    res = run(["go", "version"], cwd=os.getcwd(), timeout=60)
+    res = run(["go", "version"], cwd=os.getcwd(), timeout=60, isolate=True)
     return res.stdout or ""

@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .base import BuildStep, DetectionContext, Runner
+from .custom import CommandRunner, parse_custom_output
 from .golang import GoTestRunner, detect_go, parse_go_test_json
 from .java import GradleRunner, MavenRunner, detect_java, parse_junit_dirs
 from .javascript import (
@@ -49,8 +50,12 @@ class DetectionFailed(Exception):
 
     def __init__(self, repo: str, tried: list[str]):
         super().__init__(
-            f"no test runner could be detected in {repo!r}; tried: {', '.join(tried)}. "
-            f"Pass an explicit command with --test-command to proceed."
+            f"no test runner could be detected in {repo!r}; tried: {', '.join(tried)} "
+            f"(markers looked for: pyproject.toml/setup.cfg/tox.ini, package.json, go.mod, "
+            f"Cargo.toml, pom.xml/build.gradle). Override detection with "
+            f"`--test-command '<your command>'` on the CLI, or the `test-command` input in "
+            f"the Action; add `--junit-path` / `junit-path` if that command can write JUnit "
+            f"XML, which makes the assert-vs-build distinction exact instead of heuristic."
         )
         self.tried = tried
 
@@ -70,6 +75,7 @@ __all__ = [
     "REGISTRY",
     "BuildStep",
     "CargoTestRunner",
+    "CommandRunner",
     "DetectionContext",
     "DetectionFailed",
     "GoTestRunner",
@@ -87,6 +93,7 @@ __all__ = [
     "detect_runner",
     "detect_rust",
     "parse_cargo_test_text",
+    "parse_custom_output",
     "parse_exit_code_only",
     "parse_go_test_json",
     "parse_jest_json",

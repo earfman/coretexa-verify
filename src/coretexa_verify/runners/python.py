@@ -80,7 +80,7 @@ class PytestRunner(Runner):
 
         argv = [*self.launcher, *targets, "--collect-only", "-q",
                 "-p", "no:cacheprovider", "--no-header", *self.extra_args, *(extra or [])]
-        res = run(argv, cwd=self.cwd, timeout=timeout, env=self.subprocess_env())
+        res = run(argv, cwd=self.cwd, timeout=timeout, env=self.subprocess_env(), isolate=True)
         if res.timed_out or res.returncode not in (0, 5):
             return None
         return parse_collect_only(res.stdout)

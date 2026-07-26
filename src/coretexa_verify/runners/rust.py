@@ -589,7 +589,7 @@ class CargoTestRunner(Runner):
         for crate in crates:
             argv += ["-p", crate]
         argv += ["--", "--list"]
-        res = run(argv, cwd=self.cwd, timeout=timeout, env=self.subprocess_env())
+        res = run(argv, cwd=self.cwd, timeout=timeout, env=self.subprocess_env(), isolate=True)
         if res.timed_out or res.returncode != 0:
             return None
         ids: list[str] = []
