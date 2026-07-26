@@ -28,6 +28,8 @@ tests still passing: cmscontrib/loaders/italy_yaml.py hunk 2 (head lines
 
 ## Quick start (GitHub Action)
 
+Paste one file. There is no step to write.
+
 ```yaml
 # .github/workflows/coretexa-verify.yml
 name: coretexa-verify
@@ -46,19 +48,39 @@ jobs:
         with:
           fetch-depth: 0            # required: we need the merge base
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # Install YOUR project's test dependencies exactly as your CI does.
-      # coretexa-verify runs your tests with the interpreter on PATH.
-      - run: pip install -e ".[dev]"
-
       - uses: earfman/coretexa-verify@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           # fail-on: no-gate     # uncomment to make NO_GATE block the merge
 ```
+
+<details><summary>What changed in 1.1.0 — before and after</summary>
+
+Until 1.1.0 you had to set up a language toolchain and install your own test
+dependencies before the Action could do anything. That step was the wall most
+people never got over, because getting it exactly right meant duplicating your
+existing CI job:
+
+```yaml
+      # BEFORE (1.0.x) — you had to write these three steps yourself
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"      # ...and get it right for YOUR repo
+      - uses: earfman/coretexa-verify@v1
+```
+
+```yaml
+      # AFTER (1.1.0)
+      - uses: earfman/coretexa-verify@v1
+```
+
+The Action now detects your project's own declared test dependencies and
+installs them, using the interpreter already on the runner. It reads only files
+you already committed, and it always prints the command it chose and the
+evidence that chose it. See [Dependency install](#dependency-install).
+
+</details>
 
 It writes the verdict to the job summary, sets outputs, and keeps **one** PR
 comment that it updates in place — never a new comment per push.
@@ -75,6 +97,9 @@ gets turned off on its second. Opt in with `fail-on` when you trust it.
 | `fail-on` | `never` | `never`, `no-gate`, `no-gate-or-inconclusive`, `not-gate-holds` |
 | `timeout` | `900` | per test-run timeout, in seconds |
 | `localize` | `auto` | `auto`, `always`, `never` — see [Localisation](#localisation) |
+| `install-deps` | `true` | detect and install the repo's own test dependencies — see [Dependency install](#dependency-install) |
+| `install-command` | *(none)* | explicit install command; overrides detection entirely |
+| `install-timeout` | `600` | timeout for each install command, in seconds |
 | `github-token` | *(none)* | enables the PR comment; needs `pull-requests: write` |
 | `comment` | `true` | set `false` to skip the comment even with a token |
 | `working-directory` | the workspace | repository root to analyse |
@@ -102,6 +127,10 @@ python -m coretexa_verify --repo . --base origin/main --json
 
 Useful flags: `--json`, `--markdown`, `--timeout`, `--localize`, `--no-refine`,
 `--test-glob`, `--source-glob`, `--fail-on`, `--runner-arg`.
+
+Dependency install: `--install-deps` / `--no-install-deps` (default: on),
+`--install-command CMD`, `--install-timeout SECONDS` (default: 600). These are
+the same three controls as the Action inputs, under the same names.
 
 ---
 
@@ -182,6 +211,100 @@ reason for choosing it are always printed.
 
 If detection fails, the verdict is `INCONCLUSIVE` with the reason. We never guess
 a command.
+
+### Dependency install
+
+Your tests need your dependencies. Rather than making you write that step,
+coretexa-verify detects it — from files **you already committed**, in a fixed
+priority order, and it prints both the command it chose and the evidence for
+choosing it. It never installs a package the repository did not ask for.
+
+**Python** (first match wins):
+
+| # | evidence | command |
+|---|---|---|
+| 1 | `uv.lock` committed **and** `uv` on PATH | `uv sync --frozen` |
+| 2 | `poetry.lock`, or `[tool.poetry]` in `pyproject.toml`, **and** `poetry` on PATH | `poetry install` |
+| 3 | `[project.optional-dependencies]` declares `test`, `tests`, `testing`, `dev`, `devel`, `develop` or `development` | `pip install -e ".[<extra>]"` |
+| 4 | a dev/test requirements file: `requirements-dev.txt`, `requirements_dev.txt`, `dev-requirements.txt`, `requirements/dev.txt`, `requirements-test.txt`, `requirements_test.txt`, `requirements/test.txt`, `requirements/tests.txt` | `pip install [-e .] [-r requirements.txt] -r <file>` |
+| 5 | `requirements.txt` | `pip install [-e .] -r requirements.txt` |
+| 6 | `pyproject.toml`, `setup.py`, or `setup.cfg` with `[metadata]` | `pip install -e .` |
+| 7 | none of the above | nothing — see below |
+
+**JavaScript / TypeScript** — the lockfile decides:
+
+| # | evidence | command |
+|---|---|---|
+| 1 | `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` |
+| 2 | `yarn.lock` | `yarn install --frozen-lockfile` |
+| 3 | `package-lock.json` | `npm ci --no-audit --no-fund` |
+| 4 | `package.json`, no lockfile | `npm install --no-audit --no-fund` |
+
+Notes on the specifics, because they are deliberate:
+
+- **The interpreter is the runner's, not ours.** `pip` is invoked as
+  `<the python that will run your tests> -m pip`, so we can never install into
+  one environment and test in another.
+- **`-e`, always.** An editable install is what makes reverting a source file
+  something the tests actually see. A non-editable install would test a
+  *copy* of your code and quietly invalidate the whole experiment.
+- **Tiers 4 and 5 also install the project itself** when the repo is an
+  installable distribution, because a requirements file lists your test tooling,
+  not your package, and your tests almost certainly import your package.
+- **`uv sync --frozen`** rather than plain `uv sync`, so the install cannot
+  rewrite your committed `uv.lock`.
+- **If the tool a lockfile names is not on PATH we decline** rather than
+  substituting a different one — installing a `pnpm-lock.yaml` project with npm
+  would ignore the lockfile you committed. The reason is printed.
+- **Detecting nothing is not an error.** We carry on. If the tests then fail to
+  run, the verdict is `INCONCLUSIVE` and the headline says no dependency install
+  was detected, and why.
+
+Three controls, identical on the CLI and as Action inputs:
+
+```yaml
+      - uses: earfman/coretexa-verify@v1
+        with:
+          install-deps: false                # use the environment as found
+          install-command: make test-deps    # or: override detection entirely
+          install-timeout: 900
+```
+
+```bash
+python -m coretexa_verify --repo . --no-install-deps
+python -m coretexa_verify --repo . --install-command 'make test-deps'
+```
+
+`install-command` wins over detection; `install-deps: false` wins over both.
+Shell syntax in `install-command` (`&&`, pipes, redirects) is run through
+`/bin/sh -c`; anything simpler runs as argv with no shell in between.
+
+#### Build artefacts
+
+`pip install -e .` writes `*.egg-info/`; builds write `build/`, `dist/`,
+`__pycache__/`; `npm install` writes `node_modules/` and possibly a
+`package-lock.json`. Those files must never be confused with your edits or with
+our mutation, whether or not your repo gitignores them. The policy:
+
+1. **The dirty-tree refusal runs first**, on the tree exactly as we found it.
+   Nothing an install generates can cause a refusal to start.
+2. **Artefacts are identified by snapshot, not by name.** We diff `git status`
+   from immediately before and after the install. No pattern list, and no
+   assumption that you gitignore anything.
+3. **The post-install snapshot becomes the baseline** for the "did we put
+   everything back?" check that runs after every revert, so a file the install
+   touched can never be reported as our leftover.
+4. **We never revert, clean or delete an artefact.** It was not ours to create.
+   We list what appeared and leave it exactly there.
+
+Bytecode caches get the same treatment, and it matters more than it sounds:
+CPython validates a `.pyc` on the source file's mtime and size alone, and
+reverting a hunk very often leaves the byte count unchanged (`return 1` for
+`return 2`). A stale cache could therefore hand the *head* implementation to the
+*base* run and turn `GATE_HOLDS` into a confident, wrong `NO_GATE`. Every runner
+subprocess gets `PYTHONDONTWRITEBYTECODE=1` and a `PYTHONPYCACHEPREFIX` pointing
+at an empty scratch directory outside your repository, so no cache — ours or one
+already lying around — can ever answer for the source.
 
 ### Test-file classification
 
@@ -393,6 +516,48 @@ still read as `GATE_HOLDS`.
 - **Renames and whole-file additions are skipped during localisation**, because
   there is no meaningful intermediate state to revert one hunk of.
 
+### Repo shapes where the dependency install will not help
+
+Auto-install covers the common cases, not all of them. Where it cannot, it says
+so and the verdict is `INCONCLUSIVE` rather than wrong — but you will want
+`install-command` or `install-deps: false` plus your own step:
+
+- **System build dependencies.** A wheel that needs C headers (`pycups` wants
+  CUPS, `psycopg2` wants libpq) fails to build on a bare runner. This is real:
+  `ioi-isr/cms` cannot `pip install -e ".[devel]"` without `libcups2-dev`.
+  Add an `apt-get install` step and keep auto-install on — it does not have to
+  succeed for the run to work, only for the tests to become runnable.
+- **Services and databases.** Nothing we install starts a Postgres.
+- **conda / mamba environments.** Not detected at all; use `install-command`.
+- **A test extra under a name we do not recognise.** We match seven spellings.
+  A repo whose extra is `ci`, `qa` or `all` falls through to a plain
+  `pip install -e .` and its test tooling is not installed.
+- **`testutils`-style extras that are not the dev environment.** We deliberately
+  do not match these, so a repo whose *only* extra is one of them and which has
+  no requirements file gets `pip install -e .` and nothing more.
+- **Poetry groups other than the default**, and `poetry install --with docs`
+  style invocations. We run a plain `poetry install`.
+- **Yarn Berry (v2+)** rejects `--frozen-lockfile`; it wants `--immutable`. A
+  yarn 2/3/4 repo needs `install-command: yarn install --immutable`.
+- **Monorepos and workspaces.** We install at the repository root. A package
+  living in `packages/foo` with its own manifest is not installed, and
+  `working-directory` is the lever for that.
+- **Multi-language repos.** We install for the language of the *detected test
+  runner* only. A Python repo whose tests shell out to a JS build gets the
+  Python half and nothing else.
+- **Offline or index-restricted runners.** Every tier except `uv`/`poetry`
+  reaches an index. On an air-gapped runner, use `install-deps: false`.
+- **Constraint files, `PIP_*` environment pinning, and custom indexes** are
+  respected only insofar as pip reads them from the environment; we add no flags
+  of our own beyond `--disable-pip-version-check` and `--no-input`.
+- **`requirements.txt` that is a lockfile for the app, not the tests.** If the
+  test tooling lives somewhere we do not look, the install succeeds and the
+  tests still cannot run.
+- **A tracked file the install regenerates** (setuptools_scm's `_version.py`)
+  stays modified after we finish, by design — reverting it would be us editing
+  your environment. A *second* run then starts on a dirty tree and is refused.
+  That refusal is correct but surprising; commit or ignore the file.
+
 ---
 
 ## Safety
@@ -402,7 +567,10 @@ still read as `GATE_HOLDS`.
 - We use `git show <base>:<path>` rather than `git checkout <base> -- <path>` so
   the **index is never modified** — a staged revert would make a later
   `git checkout -- .` destructive.
-- We refuse to start on a dirty working tree.
+- We refuse to start on a dirty working tree — and that check runs *before*
+  the dependency install, so nothing the install generates can trigger it.
+- The dependency install only ever runs commands derived from files the
+  repository already committed. Nothing else is fetched.
 - Every subprocess has a timeout, and a timeout is reported as a result rather
   than swallowed as a failure.
 - Nothing is written outside the repository except a temporary report directory.
@@ -414,7 +582,7 @@ still read as `GATE_HOLDS`.
 ```bash
 git clone https://github.com/earfman/coretexa-verify
 cd coretexa-verify
-PYTHONPATH=src python -m pytest tests -q     # 115 tests, no network required
+PYTHONPATH=src python -m pytest tests -q     # 177 tests, no network required
 ```
 
 Layout:
@@ -425,7 +593,8 @@ src/coretexa_verify/
   selection.py   changed test files -> runnable targets, incl. fixture mapping
   refine.py      narrowing to the tests/cases this PR actually added
   hunks.py       unified-diff surgery and the behavioural-inertness rule
-  gitops.py      timeout-bounded git, and the revert/restore machinery
+  gitops.py      timeout-bounded git, revert/restore, and tree snapshots
+  deps.py        test-dependency detection and the install it runs
   runners/       the detection registry: python.py, javascript.py
   verify.py      the experiment and the verdict logic
   report.py      terminal, Markdown and JSON rendering

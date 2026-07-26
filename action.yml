@@ -29,6 +29,27 @@ inputs:
     description: "Per test-run timeout in seconds."
     required: false
     default: "900"
+  install-deps:
+    description: >-
+      Detect and install the repository's own test dependencies before running
+      (default true). Detection reads only files the repo already committed -
+      uv.lock, poetry config, a test/dev extra in pyproject.toml, a
+      requirements file, a JS lockfile - and the chosen command plus the
+      evidence for it always appear in the report. Set to false to use the
+      environment exactly as your workflow left it.
+    required: false
+    default: "true"
+  install-command:
+    description: >-
+      Explicit install command. Overrides detection entirely. Shell syntax
+      (&&, pipes, redirects) is run through `/bin/sh -c`; anything simpler runs
+      as argv with no shell in between.
+    required: false
+    default: ""
+  install-timeout:
+    description: "Timeout in seconds for each dependency-install command."
+    required: false
+    default: "600"
   localize:
     description: >-
       Per-hunk localisation. auto (default) drills into individual hunks only
@@ -84,6 +105,9 @@ runs:
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_LOCALIZE: ${{ inputs.localize }}
+        INPUT_INSTALL_DEPS: ${{ inputs.install-deps }}
+        INPUT_INSTALL_COMMAND: ${{ inputs.install-command }}
+        INPUT_INSTALL_TIMEOUT: ${{ inputs.install-timeout }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
@@ -91,9 +115,10 @@ runs:
         INPUT_SOURCE_GLOBS: ${{ inputs.source-globs }}
       run: |
         set -euo pipefail
-        # coretexa-verify is pure standard library, so there is nothing to install.
-        # It deliberately uses the interpreter already on PATH, which is the one
-        # your workflow set up and installed the project's test dependencies into.
+        # coretexa-verify is pure standard library, so *it* has nothing to install.
+        # It uses the interpreter already on PATH - the one your workflow set up -
+        # and, unless you set install-deps: false, it detects and installs your
+        # project's own declared test dependencies into that interpreter itself.
         PY="${CORETEXA_PYTHON:-python3}"
         "$PY" -c 'import sys; assert sys.version_info >= (3, 9), sys.version' \
           || { echo "::error::coretexa-verify needs Python 3.9+ on PATH"; exit 1; }
