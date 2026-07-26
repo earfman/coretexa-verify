@@ -89,6 +89,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="run whole test files instead of narrowing to the tests this PR added",
     )
 
+    dep = p.add_argument_group("dependency install")
+    dep.add_argument(
+        "--install-deps", action="store_true", default=True,
+        help="detect and install the repository's own test dependencies (default: on)",
+    )
+    dep.add_argument(
+        "--no-install-deps", action="store_false", dest="install_deps",
+        help="do not install anything; use the environment exactly as found",
+    )
+    dep.add_argument(
+        "--install-command", default="", metavar="CMD",
+        help=("explicit install command; overrides detection entirely. Shell syntax "
+              "(&&, pipes, redirects) is run through /bin/sh -c, anything simpler as argv"),
+    )
+    dep.add_argument(
+        "--install-timeout", type=int, default=600, metavar="SECONDS",
+        help="timeout for each dependency-install command (default: 600)",
+    )
+
     cls = p.add_argument_group("classification overrides")
     cls.add_argument("--test-glob", action="append", default=[], metavar="GLOB",
                      help="force paths matching GLOB to be treated as TEST (repeatable)")
@@ -156,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
             localize=args.localize,
             max_hunks=args.max_hunks,
             refine_selection=not args.no_refine,
+            install_deps=args.install_deps,
+            install_command=args.install_command,
+            install_timeout=args.install_timeout,
         )
     )
     report.warnings = cfg_warnings + report.warnings

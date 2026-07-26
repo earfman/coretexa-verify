@@ -21,15 +21,37 @@ Every verdict returned by this module is established by having actually run
 something. When we cannot run the experiment - dirty tree, unknown runner,
 nothing selectable, failing preconditions, a crash - the answer is
 ``INCONCLUSIVE`` with the specific reason, never a guess.
+
+Build-artefact policy
+---------------------
+
+Installing the repository's test dependencies generates files: ``*.egg-info/``,
+``build/``, ``dist/``, ``__pycache__/``, ``node_modules/``, occasionally a
+regenerated but *tracked* ``_version.py``. Those files must never be confused
+with the user's own edits or with our mutation. The policy, in four parts:
+
+1. **Order.** The cleanliness gate runs first, on the tree exactly as we found
+   it. Only then do we install. Nothing the install generates can therefore
+   cause a refusal to start, whether or not the repo gitignores it.
+2. **Snapshot, don't guess by name.** We snapshot ``git status`` immediately
+   before and after the install. The difference *is* the artefact set - no
+   pattern list, no assumption that the repo gitignores anything.
+3. **New baseline.** The post-install snapshot becomes the baseline for the
+   "did we put everything back?" check after every revert. A file the install
+   dirtied can never be reported as our own leftover.
+4. **Hands off.** We never back up, revert, clean or delete an artefact. It was
+   not ours to create and it is not ours to destroy - the user may have had an
+   ``*.egg-info`` before we arrived. We list what appeared and leave it there.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from dataclasses import dataclass, field
 
-from . import gitops, hunks as hunkmod, refine
+from . import deps as depsmod, gitops, hunks as hunkmod, refine
 from .classify import ClassifierConfig
 from .models import (
     ChangedFile,
@@ -43,7 +65,7 @@ from .models import (
 from .runners import DetectionFailed, Runner, detect_runner
 from .selection import classify_all, select_targets
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 LOCALIZE_AUTO = "auto"
 LOCALIZE_ALWAYS = "always"
@@ -64,6 +86,11 @@ class VerifyOptions:
     localize: str = LOCALIZE_AUTO
     max_hunks: int = 40
     refine_selection: bool = True
+    #: Detect and install the repository's own test dependencies before running.
+    install_deps: bool = True
+    #: Explicit install command; overrides detection entirely when set.
+    install_command: str = ""
+    install_timeout: int = 600
 
 
 def verify(opts: VerifyOptions) -> Report:
@@ -163,6 +190,36 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
         return _inconclusive(report, str(exc))
     report.runner = runner.info
 
+    # ---- dependency install ------------------------------------------------
+    # Deliberately here: after the cleanliness gate (so generated artefacts can
+    # never cause a refusal) and before selection refinement (which shells out
+    # to the runner and would otherwise fail for want of the very deps we are
+    # about to install).
+    baseline = _install_dependencies(repo, opts, report, runner)
+    if report.install.failed:
+        # We do *not* abandon here. A failed install matters only if it left the
+        # tests unable to run, and the precondition run is precisely the check
+        # for that - so we let it speak. If the tests do not pass at head, the
+        # verdict is INCONCLUSIVE and its headline is this failure with the real
+        # stderr attached. If they do pass, the environment was demonstrably
+        # already adequate and the verdict rests on runs that actually happened,
+        # not on a guess. Bailing out unconditionally would turn every repo with
+        # a system build dependency or an offline runner - repos whose workflows
+        # install their own deps today and work fine - into INCONCLUSIVE.
+        report.warnings.append(
+            f"the dependency install failed and the run continued against the environment as "
+            f"found: {report.install.commands[0] if report.install.commands else '(no command)'} "
+            f"-> {report.install.summary()}"
+        )
+
+    try:
+        return _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
+    finally:
+        # The bytecode scratch directory is ours; nothing in the user's tree is.
+        runner.cleanup()
+
+
+def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline) -> Report:
     targets, entries = select_targets(repo, tests, opts.classifier, runner.default_test_dir())
     if opts.refine_selection:
         targets, entries = _refine(repo, runner, opts, report, base_sha, tests, targets, entries)
@@ -191,10 +248,12 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
         head_run = runner.execute(targets, opts.timeout, report_dir, "head")
         report.head_run = head_run
         if head_run.outcome is not Outcome.PASS:
-            return _inconclusive(report, _head_failure_reason(head_run))
+            return _inconclusive(report, _head_failure_reason(head_run, report.install))
 
         # ---- stage 1: revert every source file ----------------------------
-        reverted_run = _timed_revert_all(repo, base_sha, source, runner, targets, opts, report, report_dir)
+        reverted_run = _timed_revert_all(
+            repo, base_sha, source, runner, targets, opts, report, report_dir, baseline
+        )
         if reverted_run is None:
             return _inconclusive(report, "no source file could be reverted to its base content")
         report.reverted_run = reverted_run
@@ -209,13 +268,13 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
             return _decide_stage1(report)
 
         # ---- stage 2: localise --------------------------------------------
-        _localize(repo, base_sha, source, runner, targets, opts, report, report_dir)
+        _localize(repo, base_sha, source, runner, targets, opts, report, report_dir, baseline)
 
     return _decide(report)
 
 
 def _timed_revert_all(
-    repo, base_sha, source, runner, targets, opts, report, report_dir
+    repo, base_sha, source, runner, targets, opts, report, report_dir, baseline
 ) -> TestRunResult | None:
     mutator = gitops.TreeMutator(repo, base_sha)
     try:
@@ -226,10 +285,10 @@ def _timed_revert_all(
                 return None
             return runner.execute(targets, opts.timeout, report_dir, "reverted")
     finally:
-        _check_restored(repo, mutator, report)
+        _check_restored(repo, mutator, report, baseline)
 
 
-def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir) -> None:
+def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir, baseline) -> None:
     """Revert one behavioural hunk at a time and record what the tests do."""
     report.localized = True
     all_hunks: list[tuple[str, object, str]] = []  # (path, hunk, head_text)
@@ -272,7 +331,7 @@ def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir)
                 mutator.write(path, reverted_text.encode("utf-8"))
                 run = runner.execute(targets, opts.timeout, report_dir, f"hunk{i}")
         finally:
-            _check_restored(repo, mutator, report)
+            _check_restored(repo, mutator, report, baseline)
         report.hunk_results.append(
             HunkResult(
                 path=path,
@@ -288,17 +347,109 @@ def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir)
         )
 
 
-def _check_restored(repo: str, mutator: gitops.TreeMutator, report: Report) -> None:
+def _check_restored(
+    repo: str, mutator: gitops.TreeMutator, report: Report, baseline: gitops.TreeState
+) -> None:
+    """Did we put back everything *we* changed?
+
+    ``baseline`` is the post-install snapshot, so a tracked file the dependency
+    install rewrote is not counted against us: it was never ours, and reverting
+    it would be us editing the user's environment, not restoring it.
+    """
     if mutator.errors:
         report.tree_restored = False
         report.warnings.extend(mutator.errors)
         mutator.errors = []
-    elif not gitops.is_clean(repo):  # pragma: no cover - defensive
+        return
+    leftover = sorted(set(gitops.dirty_paths(repo)) - baseline.tracked_dirty)
+    if leftover:  # pragma: no cover - defensive
         report.tree_restored = False
         report.warnings.append(
-            "the working tree is still dirty after restoration: "
-            + ", ".join(gitops.dirty_paths(repo)[:5])
+            "the working tree is still dirty after restoration: " + ", ".join(leftover[:5])
         )
+
+
+# --------------------------------------------------------------------------
+# dependency install
+# --------------------------------------------------------------------------
+
+
+def _install_dependencies(
+    repo: str, opts: VerifyOptions, report: Report, runner: Runner
+) -> gitops.TreeState:
+    """Detect + run the repo's own dependency install. Returns the new baseline.
+
+    The returned :class:`~coretexa_verify.gitops.TreeState` is the snapshot taken
+    *after* the install, and is what every later restoration check is measured
+    against. See the artefact policy in this module's docstring.
+    """
+    rep = depsmod.InstallReport(enabled=opts.install_deps, timeout_s=opts.install_timeout)
+    report.install = rep
+    before = gitops.TreeState.capture(repo)
+
+    if not opts.install_deps:
+        rep.source = "disabled"
+        rep.status = "disabled"
+        rep.evidence = "install-deps is off, so the environment was used exactly as found"
+        return before
+
+    if opts.install_command.strip():
+        commands = depsmod.parse_override(opts.install_command)
+        plan = depsmod.InstallPlan(
+            detector="override",
+            evidence="an explicit install-command was supplied, so detection was skipped entirely",
+            commands=commands,
+            language=runner.language,
+        )
+        source = "override"
+    else:
+        plan, note = depsmod.detect_install(repo, runner.language, _python_executable(runner))
+        source = "detected"
+        if plan is None:
+            rep.source = "none"
+            rep.status = "none"
+            rep.evidence = note
+            report.warnings.append(f"no dependency install was detected: {note}")
+            return before
+
+    rep_run = depsmod.run_plan(repo, plan, opts.install_timeout)
+    rep_run.source = source
+    rep_run.enabled = True
+    report.install = rep = rep_run
+
+    after = gitops.TreeState.capture(repo)
+    rep.artefacts = after.new_untracked_since(before)
+    rep.dirtied_tracked = after.new_tracked_since(before)
+    if rep.dirtied_tracked:
+        rep.notes.append(
+            "the dependency install modified tracked file(s) "
+            + ", ".join(rep.dirtied_tracked[:5])
+            + "; they were left exactly as the install left them and excluded from the "
+            "restoration check, so they can never be mistaken for this tool's own mutation"
+        )
+        report.warnings.append(rep.notes[-1])
+    if rep.artefacts:
+        rep.notes.append(
+            "the dependency install created untracked path(s) "
+            + ", ".join(rep.artefacts[:5])
+            + "; build artefacts are never reverted or deleted by this tool"
+        )
+    return after
+
+
+def _python_executable(runner: Runner) -> str:
+    """The interpreter the runner will actually use.
+
+    Installing with one interpreter and testing with another is the single most
+    confusing way this feature could fail, so we take the launcher's own python
+    whenever the runner exposes one.
+    """
+    launcher = getattr(runner, "launcher", None)
+    if isinstance(launcher, list) and launcher:
+        head = os.path.basename(launcher[0])
+        if head.startswith("python") or head in ("python", "python3"):
+            return launcher[0]
+    return sys.executable
 
 
 # --------------------------------------------------------------------------
@@ -476,7 +627,40 @@ def _decide(report: Report) -> Report:
     return report
 
 
-def _head_failure_reason(run: TestRunResult) -> str:
+def _head_failure_reason(run: TestRunResult, install: "depsmod.InstallReport | None" = None) -> str:
+    """Why the experiment could not start.
+
+    When the dependency install failed, that is almost certainly *the* reason
+    the tests will not run, so it leads - with the installer's real stderr, not
+    a paraphrase of it.
+    """
+    if install is not None and install.failed:
+        return depsmod.failure_reason(install) + "\n\nThe tests were run anyway and " + (
+            _base_head_failure_reason(run)
+        )
+    return _base_head_failure_reason(run) + _install_hint(install)
+
+
+def _install_hint(install: "depsmod.InstallReport | None") -> str:
+    """Why the precondition may have failed, when the environment is suspect.
+
+    A failure to import at head is the exact symptom of missing dependencies,
+    so if we did not install any it is dishonest to leave that out of the
+    explanation.
+    """
+    if install is None:
+        return ""
+    if install.status == "none":
+        return f" No dependency install was detected: {install.evidence}."
+    if install.status == "disabled":
+        return (
+            " Dependency installation was disabled, so the tests ran against the environment "
+            "exactly as it was found."
+        )
+    return ""
+
+
+def _base_head_failure_reason(run: TestRunResult) -> str:
     if run.outcome is Outcome.TIMEOUT:
         return (
             f"the PR's own tests exceeded the {run.timeout_s}s timeout at head, so the "

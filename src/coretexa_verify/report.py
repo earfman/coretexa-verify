@@ -41,6 +41,18 @@ def render_text(report: Report, color: bool = False) -> str:
     if report.runner:
         lines.append(f"runner    : {report.runner.id} ({report.runner.language})")
         lines.append(f"            {report.runner.reason}")
+    inst = report.install
+    if inst is not None:
+        lines.append(f"deps      : {inst.status} ({inst.source}) - {inst.summary()}")
+        for cmd in inst.commands:
+            lines.append(f"            $ {cmd}")
+        if inst.evidence:
+            lines.append(_wrap(f"            evidence: {inst.evidence}", w, subsequent="              "))
+        if inst.artefacts:
+            lines.append(f"            created (left in place): {', '.join(inst.artefacts[:6])}")
+        if inst.failed:
+            for line in (inst.stderr_tail or inst.stdout_tail).strip().splitlines()[-8:]:
+                lines.append(f"            | {line}")
 
     if report.changed_files:
         lines.append("")
@@ -137,6 +149,13 @@ def render_markdown(report: Report) -> str:
     out.append(f"| base (merge base) | `{report.base_sha[:12]}` ({report.base_ref}) |")
     if report.runner:
         out.append(f"| runner | `{report.runner.id}` — {report.runner.reason} |")
+    if report.install is not None:
+        inst = report.install
+        cmds = ", ".join(f"`{c}`" for c in inst.commands) or "_none_"
+        out.append(
+            f"| dependency install | {cmds} — {inst.summary()} "
+            f"({inst.source}: {inst.evidence or 'n/a'}) |"
+        )
     if report.test_targets:
         out.append(f"| tests run | {', '.join(f'`{t}`' for t in report.test_targets)} |")
     if report.reverted_files:

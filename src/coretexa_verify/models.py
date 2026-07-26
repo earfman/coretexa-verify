@@ -157,6 +157,8 @@ class Report:
     merge_base_sha: str = ""
     changed_files: list[ChangedFile] = field(default_factory=list)
     runner: RunnerInfo | None = None
+    #: Populated by :func:`coretexa_verify.verify.verify`; never None after a run.
+    install: Any = None
     selection: list[SelectionEntry] = field(default_factory=list)
     test_targets: list[str] = field(default_factory=list)
     head_run: TestRunResult | None = None
@@ -200,6 +202,7 @@ class Report:
                 "merge_base_sha": self.merge_base_sha,
             },
             "runner": dataclasses.asdict(self.runner) if self.runner else None,
+            "install": self.install.to_dict() if self.install is not None else None,
             "changed_files": [
                 {
                     "path": f.path,

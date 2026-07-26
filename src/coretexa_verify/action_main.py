@@ -180,6 +180,9 @@ def main() -> int:
     token = env("INPUT_GITHUB_TOKEN")
     do_comment = env_bool("INPUT_COMMENT", True)
     localize = env("INPUT_LOCALIZE", "auto") or "auto"
+    install_deps = env_bool("INPUT_INSTALL_DEPS", True)
+    install_command = env("INPUT_INSTALL_COMMAND")
+    install_timeout = int(env("INPUT_INSTALL_TIMEOUT", "600") or "600")
 
     warnings: list[str] = []
     if not base_input:
@@ -203,6 +206,9 @@ def main() -> int:
             timeout=timeout,
             classifier=classifier,
             localize=localize,
+            install_deps=install_deps,
+            install_command=install_command,
+            install_timeout=install_timeout,
             # The runner's checkout is already at the PR head; moving it would
             # fight with whatever else the workflow does.
             allow_checkout=False,

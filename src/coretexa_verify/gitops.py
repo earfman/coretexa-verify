@@ -133,8 +133,64 @@ def is_clean(repo: str) -> bool:
 
 
 def dirty_paths(repo: str) -> list[str]:
-    out = git_ok(repo, "status", "--porcelain", "--untracked-files=no")
-    return [line[3:] for line in out.splitlines() if line]
+    # NB: do not strip the output. Porcelain v1 status codes are two columns
+    # wide and " M mod.py" (worktree-modified, unstaged) starts with a space;
+    # stripping it first and then slicing [3:] eats the first character of the
+    # path, which is how this used to report "od.py".
+    res = git(repo, "status", "--porcelain", "--untracked-files=no")
+    if res.returncode != 0:
+        raise GitError(f"`git status` failed ({res.returncode}): {res.stderr.strip()}")
+    paths = []
+    for line in res.stdout.splitlines():
+        if len(line) <= 3:
+            continue
+        path = line[3:]
+        # Renames are reported as "ORIG -> DEST"; the destination is the one
+        # that exists in the tree we would have to restore.
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path)
+    return paths
+
+
+def untracked_paths(repo: str) -> list[str]:
+    """Untracked, non-ignored paths, with directories collapsed to ``dir/``.
+
+    ``--untracked-files=normal`` (rather than ``all``) keeps this bounded: a
+    freshly installed ``node_modules`` is one entry, not forty thousand.
+    """
+    res = git(repo, "status", "--porcelain", "--untracked-files=normal")
+    if res.returncode != 0:
+        return []
+    return [line[3:] for line in res.stdout.splitlines() if line.startswith("?? ")]
+
+
+@dataclass
+class TreeState:
+    """A snapshot of what git thinks is modified and what is merely lying around.
+
+    Taken once before and once after the dependency install so that anything
+    the install generates - ``*.egg-info/``, ``build/``, a regenerated
+    ``_version.py`` - can be attributed to the install rather than to the user
+    or to us. See the artefact policy in :mod:`coretexa_verify.verify`.
+    """
+
+    tracked_dirty: frozenset
+    untracked: frozenset
+
+    @classmethod
+    def capture(cls, repo: str) -> "TreeState":
+        try:
+            tracked = frozenset(dirty_paths(repo))
+        except GitError:  # pragma: no cover - defensive
+            tracked = frozenset()
+        return cls(tracked_dirty=tracked, untracked=frozenset(untracked_paths(repo)))
+
+    def new_tracked_since(self, earlier: "TreeState") -> list[str]:
+        return sorted(self.tracked_dirty - earlier.tracked_dirty)
+
+    def new_untracked_since(self, earlier: "TreeState") -> list[str]:
+        return sorted(self.untracked - earlier.untracked)
 
 
 def merge_base(repo: str, base: str, head: str, deepen_rounds: int = 3) -> str:
