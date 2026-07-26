@@ -26,6 +26,22 @@ tests still passing: cmscontrib/loaders/italy_yaml.py hunk 2 (head lines
 
 ---
 
+---
+
+## Known issues — read this before you trust a verdict (2026-07-26)
+
+Field-tested against 16 real pull requests across six repositories. Two results you should know about:
+
+**1. `NO_GATE` can be wrong on fixture-corpus suites.** On [sqlfluff#8221](https://github.com/sqlfluff/sqlfluff/pull/8221) the tool reported `NO_GATE`; the PR's own new fixture *does* fail when the source is reverted. Cause: when a changed fixture is mapped to its consumer by literal-string search, a suite that auto-discovers fixtures (and therefore never names them) is structurally unselectable, so the search matched a *different* file that passes either way. The documented safe fallback only triggers when the search finds nothing — here it found the wrong thing. Affects parser/linter/formatter projects with fixture corpora. **Until this is fixed, treat `NO_GATE` on a fixture-driven repo as "look yourself", not as a finding.**
+
+**2. 62.5% of real PRs came back `INCONCLUSIVE` out of the box.** Roughly half of those are ours, not your repo's: JS/TS monorepos are run from the repo root instead of the owning workspace package (every TS monorepo PR tested was inconclusive), `uv sync --frozen` has no pip fallback when it fails on a version pin, and the whole-suite directory fallback isn't bounded by collected-test count so it can run for fifteen minutes and time out.
+
+What did hold up: two verdicts hand-verified independently and both correct, including a genuinely non-obvious `NO_GATE` on [httpx#3777](https://github.com/encode/httpx/pull/3777); dependency auto-install fired correctly on all 22 runs; and zero tree corruption across every run including timeouts and failed installs.
+
+Fixes for 1 and 2 are the next work. Issues and counterexamples welcome — a wrong verdict is the most useful bug report you can send.
+
+---
+
 ## Quick start (GitHub Action)
 
 Paste one file. There is no step to write.
