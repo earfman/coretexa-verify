@@ -25,6 +25,11 @@ EXIT_INTERNAL_ERROR = 3
 EXIT_USAGE_ERROR = 4
 EXIT_NO_TESTS_COLLECTED = 5
 
+#: Sources that only reach the interpreter after a compile step.
+COMPILED_SOURCE_EXTENSIONS = frozenset(
+    {".pyx", ".pxd", ".pxi", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".rs", ".go"}
+)
+
 PYTEST_MARKERS = (
     "pyproject.toml",
     "setup.py",
@@ -67,15 +72,32 @@ class PytestRunner(Runner):
     def parse(self, report_path: str, exit_code: int, stdout: str, stderr: str) -> TestRunResult:
         return parse_pytest_report(report_path, exit_code, stdout, stderr)
 
-    def collect(self, targets: list[str], timeout: int) -> list[str] | None:
+    def collect(
+        self, targets: list[str], timeout: int, extra: list[str] | None = None
+    ) -> list[str] | None:
         from ..gitops import run
 
         argv = [*self.launcher, *targets, "--collect-only", "-q",
-                "-p", "no:cacheprovider", "--no-header", *self.extra_args]
-        res = run(argv, cwd=self.repo, timeout=timeout, env={"CI": "1"})
+                "-p", "no:cacheprovider", "--no-header", *self.extra_args, *(extra or [])]
+        res = run(argv, cwd=self.cwd, timeout=timeout, env=self.subprocess_env())
         if res.timed_out or res.returncode not in (0, 5):
             return None
         return parse_collect_only(res.stdout)
+
+    def artifact_risk(self, targets: list[str], source_paths: list[str]) -> str:
+        """Compiled sources cannot be reverted by rewriting the source file."""
+        compiled = sorted(
+            p for p in source_paths
+            if os.path.splitext(p)[1] in COMPILED_SOURCE_EXTENSIONS
+        )
+        if compiled:
+            return (
+                "the PR changes compiled source file(s) "
+                + ", ".join(compiled[:4])
+                + "; the tests import the already-built extension, which a source revert "
+                "does not change"
+            )
+        return ""
 
 
 def parse_pytest_report(

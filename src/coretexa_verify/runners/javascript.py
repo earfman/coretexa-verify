@@ -15,7 +15,25 @@ import re
 import shutil
 
 from ..models import Outcome, TestRunResult
-from .base import DetectionContext, Runner
+from .base import BuildStep, DetectionContext, Runner
+
+#: Directories that hold compiled output rather than source.
+BUILD_OUTPUT_DIRS = ("dist", "build", "lib", "out", "es", "esm", "cjs")
+
+#: package.json script names, in priority order, that produce that output.
+BUILD_SCRIPT_NAMES = ("build:all", "build", "build:ts", "compile", "prepare:build")
+
+#: Bare or relative import specifier in an ES module or a `require(...)` call.
+_IMPORT_RE = re.compile(
+    r"""(?:from|import)\s*\(?\s*['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)"""
+)
+
+#: A build-output directory used as a *path component*. Matching the bare
+#: substring instead would call ``src/types/index`` build output, because
+#: "types/" ends in "es/".
+_BUILT_DIR_RE = re.compile(
+    r"""(?:^|[/."'])(?:""" + "|".join(BUILD_OUTPUT_DIRS) + r""")/"""
+)
 
 #: Patterns that mean "the module graph did not load", i.e. a build-level gate.
 BUILD_ERROR_PATTERNS = (
@@ -42,7 +60,170 @@ def _read_package_json(ctx: DetectionContext) -> dict:
         return {}
 
 
-class JsonReportRunner(Runner):
+# --------------------------------------------------------------------------
+# workspaces (monorepos)
+# --------------------------------------------------------------------------
+
+
+def read_json_file(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def workspace_globs(repo: str) -> list[str]:
+    """Workspace member patterns declared by the repo, or ``[]``.
+
+    Two shapes are supported because two shapes exist: npm/yarn/bun declare
+    ``workspaces`` in package.json (array, or ``{"packages": [...]}``), pnpm
+    declares ``packages:`` in ``pnpm-workspace.yaml``. The yaml is read with a
+    line scan rather than a YAML parser - this tool has no dependencies, and
+    the fragment we need is a flat list of strings.
+    """
+    pkg = read_json_file(os.path.join(repo, "package.json"))
+    declared = pkg.get("workspaces")
+    if isinstance(declared, dict):
+        declared = declared.get("packages")
+    globs = [g for g in (declared or []) if isinstance(g, str)]
+
+    pnpm = os.path.join(repo, "pnpm-workspace.yaml")
+    if not os.path.exists(pnpm):
+        pnpm = os.path.join(repo, "pnpm-workspace.yml")
+    if os.path.exists(pnpm):
+        in_packages = False
+        try:
+            with open(pnpm, encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    line = raw.rstrip("\n")
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    if not line[:1].isspace():
+                        in_packages = line.strip().startswith("packages:")
+                        continue
+                    if in_packages and line.strip().startswith("- "):
+                        value = line.strip()[2:].strip().strip("'\"")
+                        if value:
+                            globs.append(value)
+        except OSError:  # pragma: no cover - defensive
+            pass
+    return globs
+
+
+def is_workspace(repo: str) -> bool:
+    return bool(workspace_globs(repo))
+
+
+def owning_package(repo: str, rel_path: str) -> str:
+    """Nearest ancestor directory of ``rel_path`` holding a package.json.
+
+    Returns a repo-relative directory, or ``""`` when the only package.json is
+    the repository root's.
+    """
+    parts = rel_path.replace("\\", "/").split("/")[:-1]
+    while parts:
+        candidate = "/".join(parts)
+        if os.path.exists(os.path.join(repo, candidate, "package.json")):
+            return candidate
+        parts.pop()
+    return ""
+
+
+def workspace_package_dirs(repo: str) -> dict:
+    """Map every workspace package *name* to its repo-relative directory."""
+    out: dict = {}
+    for glob_pattern in workspace_globs(repo):
+        pattern = glob_pattern.lstrip("!")
+        if glob_pattern.startswith("!"):
+            continue
+        # Only the directory prefix matters; '**/*' and '*' both mean "descend".
+        root = pattern.split("*", 1)[0].rstrip("/")
+        base = os.path.join(repo, root) if root else repo
+        if not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d != "node_modules"]
+            if "package.json" not in filenames:
+                continue
+            rel = os.path.relpath(dirpath, repo).replace("\\", "/")
+            if rel == ".":
+                continue
+            name = read_json_file(os.path.join(dirpath, "package.json")).get("name")
+            if isinstance(name, str) and name:
+                out.setdefault(name, rel)
+    return out
+
+
+def entry_points_are_built(pkg: dict) -> bool:
+    """Does this package.json point consumers at compiled output?"""
+    blob = json.dumps(
+        {k: pkg.get(k) for k in ("main", "module", "types", "typings", "exports", "browser")}
+    )
+    return bool(_BUILT_DIR_RE.search(blob))
+
+
+def detect_build_step(repo: str, timeout: int = 900) -> BuildStep | None:
+    """The repo's own build script, if it declares one we recognise."""
+    pkg = read_json_file(os.path.join(repo, "package.json"))
+    scripts = pkg.get("scripts") or {}
+    for name in BUILD_SCRIPT_NAMES:
+        if isinstance(scripts.get(name), str) and scripts[name].strip():
+            manager = _package_manager(repo)
+            if manager is None:
+                return None
+            return BuildStep(
+                argv=[manager, "run", name],
+                reason=f"package.json declares scripts.{name}={scripts[name]!r}",
+                cwd=repo,
+                timeout=timeout,
+            )
+    return None
+
+
+def _package_manager(repo: str) -> str | None:
+    if os.path.exists(os.path.join(repo, "pnpm-lock.yaml")) or os.path.exists(
+        os.path.join(repo, "pnpm-workspace.yaml")
+    ):
+        if shutil.which("pnpm"):
+            return "pnpm"
+    if os.path.exists(os.path.join(repo, "yarn.lock")) and shutil.which("yarn"):
+        return "yarn"
+    return "npm" if shutil.which("npm") else None
+
+
+class JsWorkspaceMixin:
+    """Monorepo awareness shared by every JavaScript runner."""
+
+    def focus(self, targets: list[str]) -> tuple[list[str], str] | None:
+        """Run from the workspace package that owns the selected tests.
+
+        Running a workspace's tests from the repository root is the reason
+        every JS monorepo came back INCONCLUSIVE: the root has no runner config
+        for a package's sources, so every suite fails to transform before a
+        single assertion runs. The package directory has the config, so that is
+        where the runner belongs.
+        """
+        if not is_workspace(self.repo):
+            return None
+        owners = {owning_package(self.repo, t) for t in targets if t}
+        if len(owners) != 1:
+            return None
+        owner = owners.pop()
+        if not owner:
+            return None
+        rewritten = [os.path.relpath(t, owner).replace("\\", "/") for t in targets]
+        self.cwd = os.path.join(self.repo, owner)
+        return rewritten, (
+            f"{owner}/package.json owns every selected test, and this repository declares "
+            f"workspaces, so the runner was invoked from {owner} with that package's own config"
+        )
+
+    def artifact_risk(self, targets: list[str], source_paths: list[str]) -> str:
+        return javascript_artifact_risk(self.repo, targets, source_paths)
+
+
+class JsonReportRunner(JsWorkspaceMixin, Runner):
     """Shared behaviour for jest and vitest."""
 
     language = "javascript"
@@ -56,6 +237,54 @@ class JsonReportRunner(Runner):
 
     def parse(self, report_path: str, exit_code: int, stdout: str, stderr: str) -> TestRunResult:
         return parse_jest_json(report_path, exit_code, stdout, stderr)
+
+
+def javascript_artifact_risk(repo: str, targets: list[str], source_paths: list[str]) -> str:
+    """Do the selected tests read compiled output rather than the changed source?
+
+    Two shapes count. A test that imports a path containing ``dist/`` is
+    obvious. The monorepo shape is not: a test imports a *sibling workspace
+    package* by name, and that package's package.json resolves the name to
+    ``dist/``, so the test is reading a build of the source we are about to
+    revert.
+    """
+    packages = workspace_package_dirs(repo)
+    changed_pkgs = {owning_package(repo, p) for p in source_paths}
+    changed_pkgs.discard("")
+    for target in targets:
+        path = os.path.join(repo, target)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read(200_000)
+        except OSError:  # pragma: no cover - defensive
+            continue
+        for match in _IMPORT_RE.finditer(text):
+            spec = match.group(1) or match.group(2) or ""
+            if not spec:
+                continue
+            if _BUILT_DIR_RE.search(spec):
+                return (
+                    f"{target} imports {spec!r}, which is build output rather than source"
+                )
+            owner = _matching_package(spec, packages)
+            if owner and owner in changed_pkgs:
+                pkg = read_json_file(os.path.join(repo, owner, "package.json"))
+                if entry_points_are_built(pkg):
+                    return (
+                        f"{target} imports the workspace package {spec!r}, whose package.json "
+                        f"resolves to built output under {owner}/; the tests therefore read a "
+                        f"build of the changed source, not the source itself"
+                    )
+    return ""
+
+
+def _matching_package(spec: str, packages: dict) -> str:
+    for name, directory in packages.items():
+        if spec == name or spec.startswith(name + "/"):
+            return directory
+    return ""
 
 
 class JestRunner(JsonReportRunner):
@@ -85,7 +314,7 @@ class VitestRunner(JsonReportRunner):
         ]
 
 
-class NpmTestRunner(Runner):
+class NpmTestRunner(JsWorkspaceMixin, Runner):
     """Last resort: `npm test -- <paths>`, exit-code only."""
 
     id = "npm-test"
