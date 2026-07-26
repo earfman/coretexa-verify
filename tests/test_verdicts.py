@@ -261,3 +261,16 @@ def test_parse_pr_url_rejects_other_urls():
 
     with pytest.raises(GitError):
         parse_pr_url("https://github.com/sqlfluff/sqlfluff/issues/8201")
+
+
+def test_dirty_paths_does_not_eat_the_first_character_of_a_path(repo):
+    # Porcelain v1 status is two columns wide, so an unstaged modification
+    # reads " M mod.py". Stripping before slicing used to report "od.py".
+    root, base, head = repo
+    with open(os.path.join(root, "mod.py"), "w") as fh:
+        fh.write("def f():\n    return 3\n")
+    from coretexa_verify.gitops import dirty_paths
+
+    assert dirty_paths(root) == ["mod.py"]
+    git(root, "add", "mod.py")
+    assert dirty_paths(root) == ["mod.py"]
