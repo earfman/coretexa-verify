@@ -75,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="refuse to run if selection widens beyond this many targets (default: 50)",
     )
     run.add_argument(
+        "--max-collected", type=int, default=500,
+        help=("refuse to run if a widened selection collects more than this many tests "
+              "(default: 500)"),
+    )
+    run.add_argument(
         "--localize", choices=("auto", "always", "never"), default="auto",
         help=("per-hunk localisation: 'auto' (default) drills down only when the whole-PR "
               "revert merely broke the build, 'always' also drills down when the gate holds, "
@@ -172,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
             extra_runner_args=args.runner_args,
             allow_checkout=not args.no_checkout,
             max_targets=args.max_targets,
+            max_collected=args.max_collected,
             localize=args.localize,
             max_hunks=args.max_hunks,
             refine_selection=not args.no_refine,

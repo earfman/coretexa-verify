@@ -118,16 +118,31 @@ class RunnerInfo:
 
 @dataclass
 class SelectionEntry:
-    """How one changed test file became a thing we can hand to the runner."""
+    """How one changed test file became a thing we can hand to the runner.
+
+    ``proof`` is the load-bearing addition: it is non-empty only when the link
+    between the changed file and these targets was *established*, not guessed.
+    A ``NO_GATE`` verdict is never allowed to rest on an entry with no proof -
+    see :func:`coretexa_verify.verify._enforce_soundness`.
+    """
 
     source_file: str
     targets: list[str]
-    method: str  # "direct" | "fixture-map" | "directory-fallback"
+    method: str  # "direct" | "fixture-map" | "fixture-harness" | "directory-fallback"
     detail: str = ""
+    #: Evidence that these targets really consume ``source_file``. Empty = guess.
+    proof: str = ""
+    #: Targets that came from auto-discovery-harness detection rather than a
+    #: literal name match; collected with ``-k <fixture stem>``.
+    harness_targets: list[str] = field(default_factory=list)
 
     @property
     def is_fallback(self) -> bool:
         return self.method == "directory-fallback"
+
+    @property
+    def proven(self) -> bool:
+        return bool(self.proof)
 
 
 @dataclass
@@ -143,6 +158,40 @@ class HunkResult:
     summary: str
     preview: str = ""
     failing_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BuildInfo:
+    """A repository build step we detected and are responsible for re-running.
+
+    Tests that execute build output cannot see a source revert unless the build
+    is re-run *inside* the mutation, so every mutated test run is preceded by
+    one of these. ``runs``/``failures`` make that auditable from the report.
+    """
+
+    command: list[str] = field(default_factory=list)
+    reason: str = ""
+    cwd: str = ""
+    runs: int = 0
+    failures: int = 0
+    status: str = "none"  # none | ok | failed | timeout
+    note: str = ""
+
+    @property
+    def command_str(self) -> str:
+        return " ".join(_shquote(c) for c in self.command)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "command_str": self.command_str,
+            "reason": self.reason,
+            "cwd": self.cwd,
+            "runs": self.runs,
+            "failures": self.failures,
+            "status": self.status,
+            "note": self.note,
+        }
 
 
 @dataclass
@@ -163,7 +212,16 @@ class Report:
     test_targets: list[str] = field(default_factory=list)
     head_run: TestRunResult | None = None
     reverted_run: TestRunResult | None = None
+    #: The Defect-1 targeted probe: the fixture reverted alone, source intact.
+    probe_run: TestRunResult | None = None
+    probe_note: str = ""
     reverted_files: list[str] = field(default_factory=list)
+    #: Build step re-run around every mutation, when one was detected.
+    build: BuildInfo | None = None
+    #: Monorepo package the tests were actually run from, relative to the repo.
+    workspace_package: str = ""
+    #: Non-empty when test results may be served by stale build output.
+    build_artifact_risk: str = ""
     hunk_results: list[HunkResult] = field(default_factory=list)
     inert_hunks: list[str] = field(default_factory=list)
     localized: bool = False
@@ -214,11 +272,18 @@ class Report:
                 }
                 for f in self.changed_files
             ],
-            "selection": [dataclasses.asdict(s) for s in self.selection],
+            "selection": [
+                {**dataclasses.asdict(s), "proven": s.proven} for s in self.selection
+            ],
             "test_targets": self.test_targets,
             "reverted_files": self.reverted_files,
             "head_run": run(self.head_run),
             "reverted_run": run(self.reverted_run),
+            "probe_run": run(self.probe_run),
+            "probe_note": self.probe_note,
+            "build": self.build.to_dict() if self.build is not None else None,
+            "workspace_package": self.workspace_package,
+            "build_artifact_risk": self.build_artifact_risk,
             "localized": self.localized,
             "hunk_results": [
                 {**dataclasses.asdict(h), "outcome": h.outcome.value} for h in self.hunk_results

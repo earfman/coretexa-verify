@@ -134,6 +134,9 @@ class InstallReport:
     #: restoration check so they can never be mistaken for our own mutation.
     dirtied_tracked: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Every installer we tried, in order, including the ones that failed.
+    #: A fallback is only honest if the attempt it replaced is still visible.
+    attempts: list[dict] = field(default_factory=list)
 
     @property
     def ran(self) -> bool:
@@ -171,6 +174,7 @@ class InstallReport:
             "artefacts": self.artefacts,
             "dirtied_tracked": self.dirtied_tracked,
             "notes": self.notes,
+            "attempts": self.attempts,
         }
 
 
@@ -385,6 +389,118 @@ def detect_python_install(repo: str, python_exe: str) -> tuple[InstallPlan | Non
     )
 
 
+def python_install_plans(repo: str, python_exe: str) -> tuple[list[InstallPlan], str]:
+    """The whole detection table for a Python repo, in priority order.
+
+    :func:`detect_python_install` returns only the first entry; this returns the
+    rest as well so that a failing installer can fall back down the table
+    instead of walking us into a guaranteed INCONCLUSIVE. The "tool declared but
+    not on PATH" refusals are deliberately *not* softened here: installing a
+    poetry project with pip would install a different set of packages, which is
+    a wrong answer rather than a slower one.
+    """
+    first, note = detect_python_install(repo, python_exe)
+    if first is None:
+        return [], note
+
+    plans = [first]
+    pyproject = _read(repo, "pyproject.toml") if _exists(repo, "pyproject.toml") else ""
+    pip = [python_exe, "-m", "pip", "install", *_PIP_FLAGS]
+    installable = _installable(repo)
+
+    def push(plan: InstallPlan) -> None:
+        if all(plan.commands != existing.commands for existing in plans):
+            plans.append(plan)
+
+    if pyproject:
+        lowered = {name.lower(): name for name in optional_dependency_extras(pyproject)}
+        for candidate in TEST_EXTRA_NAMES:
+            if candidate in lowered:
+                extra = lowered[candidate]
+                push(
+                    InstallPlan(
+                        detector="python:pyproject-extra",
+                        evidence=(
+                            f"pyproject.toml declares [project.optional-dependencies].{extra} "
+                            f"(matched {candidate!r} from the test-extra list)"
+                        ),
+                        commands=[[*pip, "-e", f".[{extra}]"]],
+                        language="python",
+                    )
+                )
+                break
+
+    dev_req = next((f for f in DEV_REQUIREMENTS_FILES if _exists(repo, f)), None)
+    base_req = "requirements.txt" if _exists(repo, "requirements.txt") else None
+    if dev_req or base_req:
+        args: list[str] = []
+        evidence_bits: list[str] = []
+        if installable:
+            args += ["-e", "."]
+            evidence_bits.append(f"{installable} makes the project installable (editable)")
+        for rel in (base_req, dev_req):
+            if rel:
+                args += ["-r", rel]
+                evidence_bits.append(f"{rel} is committed")
+        push(
+            InstallPlan(
+                detector="python:requirements-dev" if dev_req else "python:requirements",
+                evidence="; ".join(evidence_bits),
+                commands=[[*pip, *args]],
+                language="python",
+            )
+        )
+
+    if installable:
+        push(
+            InstallPlan(
+                detector="python:editable",
+                evidence=f"{installable} makes the project installable",
+                commands=[[*pip, "-e", "."]],
+                language="python",
+            )
+        )
+    return plans, ""
+
+
+def javascript_install_plans(repo: str) -> tuple[list[InstallPlan], str]:
+    """Lockfile-respecting install first, then the same manager unpinned."""
+    first, note = detect_javascript_install(repo)
+    if first is None:
+        return [], note
+    plans = [first]
+    relaxed = {
+        "js:pnpm": (["pnpm", "install", "--no-frozen-lockfile"], "pnpm"),
+        "js:yarn": (["yarn", "install"], "yarn"),
+        "js:npm-ci": (["npm", "install", "--no-audit", "--no-fund"], "npm"),
+    }.get(first.detector)
+    if relaxed is not None:
+        argv, tool = relaxed
+        plans.append(
+            InstallPlan(
+                detector=first.detector + "-relaxed",
+                evidence=(
+                    f"fallback: the lockfile-pinned {tool} install failed, so the same manager "
+                    f"was retried without the frozen-lockfile constraint"
+                ),
+                commands=[argv],
+                language="javascript",
+            )
+        )
+    return plans, ""
+
+
+def detect_install_chain(
+    repo: str, language: str, python_exe: str
+) -> tuple[list[InstallPlan], str]:
+    """Every install we are willing to try, best first. See :func:`detect_install`."""
+    if language == "python":
+        return python_install_plans(repo, python_exe)
+    if language == "javascript":
+        return javascript_install_plans(repo)
+    return [], f"no dependency detection is implemented for the {language!r} runner"
+
+
 def detect_javascript_install(repo: str) -> tuple[InstallPlan | None, str]:
     """Return ``(plan, note)`` for a JS/TS repository. The lockfile decides."""
     if not _exists(repo, "package.json"):
@@ -496,6 +612,47 @@ def run_plan(repo: str, plan: InstallPlan, timeout: int) -> InstallReport:
     return rep
 
 
+def run_plans(repo: str, plans: list[InstallPlan], timeout: int) -> InstallReport:
+    """Run each plan until one succeeds; record every attempt either way.
+
+    A silent fallback would be worse than no fallback: the report has to say
+    which installer we actually ended up using and what the first one did, or
+    the user cannot reproduce the run.
+    """
+    if not plans:  # pragma: no cover - callers check first
+        return InstallReport(enabled=True, status="none")
+
+    rep: InstallReport | None = None
+    for index, plan in enumerate(plans):
+        attempt = run_plan(repo, plan, timeout)
+        attempt.attempts = list(rep.attempts) if rep is not None else []
+        attempt.attempts.append(
+            {
+                "detector": plan.detector,
+                "evidence": plan.evidence,
+                "commands": plan.display,
+                "status": attempt.status,
+                "exit_code": attempt.exit_code,
+                "duration_s": attempt.duration_s,
+                "stderr_tail": attempt.stderr_tail[-1200:],
+            }
+        )
+        rep = attempt
+        if attempt.status == "ok":
+            if index:
+                rep.notes.append(
+                    f"the first {index} detected installer(s) failed; this run used the "
+                    f"fallback `{plan.display[0] if plan.display else ''}`"
+                )
+            return rep
+    assert rep is not None
+    rep.notes.append(
+        f"all {len(plans)} detected installer(s) failed; the last one's output is shown above "
+        f"and every attempt is recorded in the report"
+    )
+    return rep
+
+
 def _tail(text: str, limit: int = TAIL_CHARS) -> str:
     text = text or ""
     if len(text) <= limit:
@@ -515,7 +672,13 @@ def failure_reason(rep: InstallReport) -> str:
     detail = (rep.stderr_tail or rep.stdout_tail or "").strip()
     if len(detail) > 1200:
         detail = "...[truncated]...\n" + detail[-1200:]
+    tried = ""
+    if len(rep.attempts) > 1:
+        tried = "\ninstallers tried, in order: " + "; ".join(
+            f"{a['detector']} (`{(a['commands'] or [''])[0]}`) -> {a['status']}"
+            for a in rep.attempts
+        )
     return (
         f"the dependency install failed (exit {rep.exit_code}), so any test result would have "
-        f"been about a broken environment rather than about this PR: `{cmd}`\n{detail}"
+        f"been about a broken environment rather than about this PR: `{cmd}`{tried}\n{detail}"
     )

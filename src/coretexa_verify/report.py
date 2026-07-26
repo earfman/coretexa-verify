@@ -50,9 +50,26 @@ def render_text(report: Report, color: bool = False) -> str:
             lines.append(_wrap(f"            evidence: {inst.evidence}", w, subsequent="              "))
         if inst.artefacts:
             lines.append(f"            created (left in place): {', '.join(inst.artefacts[:6])}")
+        if len(inst.attempts) > 1:
+            lines.append("            attempts (in order):")
+            for a in inst.attempts:
+                cmd = (a.get("commands") or [""])[0]
+                lines.append(f"              {a.get('status')}  {a.get('detector')}: $ {cmd}")
         if inst.failed:
             for line in (inst.stderr_tail or inst.stdout_tail).strip().splitlines()[-8:]:
                 lines.append(f"            | {line}")
+    if report.build is not None:
+        b = report.build
+        lines.append(
+            f"build     : {b.status} - re-run before every test run ({b.runs} run(s), "
+            f"{b.failures} failure(s))"
+        )
+        lines.append(f"            $ {b.command_str}")
+        lines.append(_wrap(f"            reason: {b.reason}", w, subsequent="              "))
+    if report.workspace_package:
+        lines.append(f"workspace : tests run from {report.workspace_package}/")
+    if report.build_artifact_risk:
+        lines.append(_wrap(f"artefacts : {report.build_artifact_risk}", w, subsequent="            "))
 
     if report.changed_files:
         lines.append("")
@@ -72,8 +89,15 @@ def render_text(report: Report, color: bool = False) -> str:
             lines.append(f"    -> {arrow}   [{s.method}]")
             if s.detail:
                 lines.append(f"       {s.detail}")
+            lines.append(
+                f"       proof: {s.proof}" if s.proof else "       proof: NONE (mapping is a guess)"
+            )
 
-    for label, run in (("run at head", report.head_run), ("run with source reverted", report.reverted_run)):
+    for label, run in (
+        ("run at head", report.head_run),
+        ("run with source reverted", report.reverted_run),
+        ("run with only the fixture reverted (probe)", report.probe_run),
+    ):
         if run is None:
             continue
         lines.append("")
@@ -88,6 +112,10 @@ def render_text(report: Report, color: bool = False) -> str:
         hidden = len(run.failing_ids) + len(run.erroring_ids) - 20
         if hidden > 0:
             lines.append(f"  ... {hidden} more")
+
+    if report.probe_note:
+        lines.append("")
+        lines.append(_wrap(f"fixture probe: {report.probe_note}", w, subsequent="  "))
 
     if report.hunk_results:
         lines.append("")
@@ -156,6 +184,14 @@ def render_markdown(report: Report) -> str:
             f"| dependency install | {cmds} — {inst.summary()} "
             f"({inst.source}: {inst.evidence or 'n/a'}) |"
         )
+    if report.build is not None:
+        b = report.build
+        out.append(
+            f"| build | `{b.command_str}` — re-run before every test run "
+            f"({b.runs} run(s), {b.failures} failure(s)) |"
+        )
+    if report.workspace_package:
+        out.append(f"| workspace package | `{report.workspace_package}` |")
     if report.test_targets:
         out.append(f"| tests run | {', '.join(f'`{t}`' for t in report.test_targets)} |")
     if report.reverted_files:
@@ -165,7 +201,11 @@ def render_markdown(report: Report) -> str:
     if report.head_run or report.reverted_run:
         out.append("<details><summary>Runs</summary>")
         out.append("")
-        for label, run in (("At head", report.head_run), ("With source reverted to base", report.reverted_run)):
+        for label, run in (
+            ("At head", report.head_run),
+            ("With source reverted to base", report.reverted_run),
+            ("With only the fixture reverted (mapping probe)", report.probe_run),
+        ):
             if run is None:
                 continue
             out.append(f"**{label}** — `{run.outcome.value}`: {run.summary()} ({run.duration_s}s)")
@@ -214,6 +254,7 @@ def render_markdown(report: Report) -> str:
         for s in report.selection:
             targets = ", ".join(f"`{t}`" for t in s.targets) or "_nothing_"
             out.append(f"- `{s.source_file}` → {targets} _({s.method}{'; ' + s.detail if s.detail else ''})_")
+            out.append(f"  - proof: {s.proof or '**none — this mapping is a guess**'}")
         out.append("")
         out.append("</details>")
         out.append("")

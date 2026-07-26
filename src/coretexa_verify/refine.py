@@ -114,13 +114,65 @@ def added_fixture_keys(repo: str, base: str, head: str, path: str) -> list[str]:
     return keys
 
 
+#: Shorter than this and a fixture stem matches too much to be evidence.
+MIN_STEM_LENGTH = 3
+
+
+def fixture_stem(path: str) -> str:
+    """``test/fixtures/dialects/clickhouse/exchange.sql`` -> ``exchange``."""
+    import posixpath
+
+    return posixpath.splitext(posixpath.basename(path.replace("\\", "/")))[0]
+
+
+def parametrised_id(node_id: str) -> str:
+    """The ``[...]`` part of a node id, or ``""`` for an unparametrised test."""
+    open_at = node_id.find("[")
+    close_at = node_id.rfind("]")
+    return node_id[open_at + 1 : close_at] if open_at != -1 and close_at > open_at else ""
+
+
+def filter_collected_by_stem(node_ids: list[str], path: str) -> tuple[list[str], str]:
+    """Collected ids whose *parameter* literally names the fixture.
+
+    The basename (``exchange.sql``) is stronger evidence than the bare stem
+    (``exchange``), so it wins when both are present. This is the sqlfluff
+    #8221 signal: ``dialects_test.py`` parametrises its cases on the fixture
+    file name, so the fixture's own name shows up in the collected node id even
+    though the module never mentions the dialect.
+
+    Matching is deliberately restricted to the parametrised part of the id. A
+    match anywhere in the id would be satisfied by ``widget_test.py::
+    test_widget_is_a_string`` - a module that merely shares the fixture's name -
+    which is precisely the false positive this whole change exists to kill.
+    """
+    import posixpath
+
+    basename = posixpath.basename(path.replace("\\", "/"))
+    stem = fixture_stem(path)
+    if len(stem) < MIN_STEM_LENGTH:
+        return [], ""
+    params = [(nid, parametrised_id(nid)) for nid in node_ids]
+    by_basename = [nid for nid, param in params if param and basename in param]
+    if by_basename:
+        return by_basename, (
+            f"the collected test id(s) are parametrised on the fixture file name {basename!r}"
+        )
+    by_stem = [nid for nid, param in params if param and stem in param]
+    if by_stem:
+        return by_stem, (
+            f"the collected test id(s) are parametrised on the fixture stem {stem!r}"
+        )
+    return [], ""
+
+
 def filter_collected_by_keys(node_ids: list[str], keys: list[str]) -> list[str]:
     """Keep collected parametrised ids whose parameter mentions an added key."""
     if not keys:
         return []
     hits: list[str] = []
     for nid in node_ids:
-        param = nid[nid.find("[") + 1 : nid.rfind("]")] if "[" in nid and nid.rfind("]") > nid.find("[") else ""
+        param = parametrised_id(nid)
         if not param:
             continue
         if any(key in param for key in keys):

@@ -183,6 +183,7 @@ def main() -> int:
     install_deps = env_bool("INPUT_INSTALL_DEPS", True)
     install_command = env("INPUT_INSTALL_COMMAND")
     install_timeout = int(env("INPUT_INSTALL_TIMEOUT", "600") or "600")
+    max_collected = int(env("INPUT_MAX_COLLECTED", "500") or "500")
 
     warnings: list[str] = []
     if not base_input:
@@ -204,6 +205,7 @@ def main() -> int:
             base=base_ref,
             head=head_input,
             timeout=timeout,
+            max_collected=max_collected,
             classifier=classifier,
             localize=localize,
             install_deps=install_deps,

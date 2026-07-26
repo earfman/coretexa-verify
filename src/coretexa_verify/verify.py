@@ -56,6 +56,7 @@ from .classify import ClassifierConfig
 from .models import (
     ChangedFile,
     HunkResult,
+    Kind,
     Outcome,
     Report,
     SelectionEntry,
@@ -63,9 +64,14 @@ from .models import (
     Verdict,
 )
 from .runners import DetectionFailed, Runner, detect_runner
+from .runners.javascript import detect_build_step
 from .selection import classify_all, select_targets
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+#: Reason attached to a verdict that had to be downgraded because a changed
+#: fixture could not be tied to a test that reads it. Quoted in the README.
+UNPROVEN_FIXTURE_REASON = "changed test fixture could not be provably mapped to a consuming test"
 
 LOCALIZE_AUTO = "auto"
 LOCALIZE_ALWAYS = "always"
@@ -82,6 +88,10 @@ class VerifyOptions:
     extra_runner_args: list[str] = field(default_factory=list)
     allow_checkout: bool = True
     max_targets: int = 50
+    #: Refuse to run when a *widened* selection collects more tests than this.
+    #: Bounding by collected count rather than target count is the difference
+    #: between refusing in 20s and timing out after 900.
+    max_collected: int = 500
     #: auto = localise only when the whole-PR revert merely broke the build.
     localize: str = LOCALIZE_AUTO
     max_hunks: int = 40
@@ -113,6 +123,13 @@ def verify(opts: VerifyOptions) -> Report:
         merge_base_sha = gitops.merge_base(repo, base_tip, head_sha)
     except gitops.GitError as exc:
         return _inconclusive(report, str(exc))
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        report.warnings.append(
+            "running as uid 0: a test that asserts a permission error cannot fail for root, so "
+            "any such test is incapable of detecting the revert and NO_GATE may be an artefact "
+            "of the user this ran as"
+        )
 
     report.head_ref = opts.head
     report.head_sha = head_sha
@@ -213,7 +230,9 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
         )
 
     try:
-        return _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
+        return _soften_deletion_only(
+            _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
+        )
     finally:
         # The bytecode scratch directory is ours; nothing in the user's tree is.
         runner.cleanup()
@@ -221,8 +240,11 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
 
 def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline) -> Report:
     targets, entries = select_targets(repo, tests, opts.classifier, runner.default_test_dir())
+    collected: list[str] | None = None
     if opts.refine_selection:
-        targets, entries = _refine(repo, runner, opts, report, base_sha, tests, targets, entries)
+        targets, entries, collected = _refine(
+            repo, runner, opts, report, base_sha, tests, targets, entries
+        )
     report.selection = entries
     report.test_targets = targets
 
@@ -230,11 +252,24 @@ def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
         return _inconclusive(
             report, "none of the PR's test changes could be mapped to a runnable test target"
         )
-    if len(targets) > opts.max_targets:
+    # --max-targets exists to stop us running a pile of whole files or whole
+    # directories. A selection of individual node ids is the opposite of that -
+    # it is the narrowest thing we can ask for - so it is bounded by
+    # --max-collected instead, which counts tests rather than command arguments.
+    whole_paths = [t for t in targets if "::" not in t]
+    if len(whole_paths) > opts.max_targets:
         return _inconclusive(
             report,
-            f"selection widened to {len(targets)} targets (limit {opts.max_targets}); refusing "
-            f"to run a suite that large as a proxy for this PR's tests",
+            f"selection widened to {len(whole_paths)} whole test file/directory targets "
+            f"(limit {opts.max_targets}); refusing to run a suite that large as a proxy for "
+            f"this PR's tests",
+        )
+    if len(targets) > opts.max_collected:
+        return _inconclusive(
+            report,
+            f"selection resolved to {len(targets)} individual tests, over the --max-collected "
+            f"limit of {opts.max_collected}; refusing to run a suite that large as a proxy for "
+            f"this PR's tests",
         )
     if any(e.is_fallback for e in entries):
         widened = ", ".join(e.source_file for e in entries if e.is_fallback)
@@ -243,34 +278,142 @@ def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
             f"directory instead, so the result covers more than just this PR's tests"
         )
 
-    with tempfile.TemporaryDirectory(prefix="coretexa-verify-") as report_dir:
-        # ---- precondition -------------------------------------------------
-        head_run = runner.execute(targets, opts.timeout, report_dir, "head")
-        report.head_run = head_run
-        if head_run.outcome is not Outcome.PASS:
-            return _inconclusive(report, _head_failure_reason(head_run, report.install))
+    refusal = _collection_cap(repo, runner, opts, report, targets, entries, collected)
+    if refusal:
+        return _inconclusive(report, refusal)
 
-        # ---- stage 1: revert every source file ----------------------------
-        reverted_run = _timed_revert_all(
-            repo, base_sha, source, runner, targets, opts, report, report_dir, baseline
+    # ---- build artefacts (computed on repo-relative paths) ----------------
+    repo_targets = list(targets)
+    report.build_artifact_risk = runner.artifact_risk(repo_targets, [f.path for f in source])
+
+    # ---- monorepo: run from the package that owns the tests ---------------
+    focused = runner.focus(targets)
+    if focused is not None:
+        targets, why = focused
+        report.workspace_package = os.path.relpath(runner.cwd, repo).replace("\\", "/")
+        report.test_targets = targets
+        report.warnings.append(why)
+
+    _prepare_build(repo, opts, report, runner)
+
+    mutated_build = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="coretexa-verify-") as report_dir:
+            # ---- precondition ---------------------------------------------
+            head_run = runner.execute(targets, opts.timeout, report_dir, "head")
+            report.head_run = head_run
+            if head_run.outcome is not Outcome.PASS:
+                return _inconclusive(report, _head_failure_reason(head_run, report.install))
+
+            # ---- stage 1: revert every source file ------------------------
+            mutated_build = runner.build_step is not None
+            reverted_run = _timed_revert_all(
+                repo, base_sha, source, runner, targets, opts, report, report_dir, baseline
+            )
+            if reverted_run is None:
+                return _inconclusive(report, "no source file could be reverted to its base content")
+            report.reverted_run = reverted_run
+
+            stage2 = (
+                reverted_run.outcome is Outcome.BUILD_ERROR
+                or (reverted_run.outcome is Outcome.ASSERT_FAIL and opts.localize == LOCALIZE_ALWAYS)
+            ) and opts.localize != LOCALIZE_NEVER
+            if stage2:
+                _localize(
+                    repo, base_sha, source, runner, targets, opts, report, report_dir, baseline
+                )
+                report = _decide(report)
+            else:
+                report = _decide_stage1(report)
+
+            return _enforce_soundness(
+                repo, opts, report, base_sha, runner, tests, targets, report_dir, baseline
+            )
+    finally:
+        if mutated_build:
+            _rebuild_at_head(report, runner)
+
+
+def _collection_cap(
+    repo: str,
+    runner: Runner,
+    opts: VerifyOptions,
+    report: Report,
+    targets: list[str],
+    entries: list[SelectionEntry],
+    collected: list[str] | None,
+) -> str:
+    """Refuse a *widened* selection by how many tests it collects, not how many
+    paths it names.
+
+    A single bare directory target is one "target" and six thousand tests. The
+    old target-count limit waved it through and the run then died on the 900s
+    timeout with nothing to show; counting what the runner actually collected
+    costs one ``--collect-only`` and refuses in seconds.
+    """
+    widened_by = [e.source_file for e in entries if e.is_fallback]
+    bare_dirs = [
+        t for t in targets
+        if "::" not in t and os.path.isdir(os.path.join(repo, t))
+    ]
+    if not widened_by and not bare_dirs:
+        return ""
+
+    counted = collected
+    if counted is None:
+        counted = runner.collect(targets, min(opts.timeout, 300))
+    if counted is None:
+        report.warnings.append(
+            "the selection was widened to a whole directory and this runner cannot enumerate "
+            "tests, so the collected-test cap could not be applied"
         )
-        if reverted_run is None:
-            return _inconclusive(report, "no source file could be reverted to its base content")
-        report.reverted_run = reverted_run
+        return ""
+    if len(counted) <= opts.max_collected:
+        return ""
+    cause = (
+        f"could not map {', '.join(widened_by)} to a specific test module"
+        if widened_by
+        else f"the selection includes the bare directory target(s) {', '.join(bare_dirs)}"
+    )
+    return (
+        f"{cause}, and the widened selection collects {len(counted)} tests, over the "
+        f"--max-collected limit of {opts.max_collected}. Running a suite that size as a proxy "
+        f"for this PR's tests would measure the suite, not the PR."
+    )
 
-        if reverted_run.outcome is Outcome.PASS:
-            return _decide_stage1(report)
-        if reverted_run.outcome in (Outcome.TIMEOUT, Outcome.RUNNER_ERROR, Outcome.NO_TESTS_RUN):
-            return _decide_stage1(report)
-        if reverted_run.outcome is Outcome.ASSERT_FAIL and opts.localize != LOCALIZE_ALWAYS:
-            return _decide_stage1(report)
-        if opts.localize == LOCALIZE_NEVER:
-            return _decide_stage1(report)
 
-        # ---- stage 2: localise --------------------------------------------
-        _localize(repo, base_sha, source, runner, targets, opts, report, report_dir, baseline)
+def _prepare_build(repo: str, opts: VerifyOptions, report: Report, runner: Runner) -> None:
+    """Detect the repo's build step and hand it to the runner.
 
-    return _decide(report)
+    From here on the runner re-runs it before *every* test run, so a reverted
+    source file is always reflected in whatever the tests import.
+    """
+    if runner.language != "javascript":
+        return
+    step = detect_build_step(repo, timeout=min(opts.timeout, 900))
+    if step is None:
+        return
+    runner.build_step = step
+    report.build = step.info()
+    runner.build_info = report.build
+
+
+def _rebuild_at_head(report: Report, runner: Runner) -> None:
+    """Leave the build output matching the restored head source, not a revert."""
+    info = runner.run_build()
+    if info is not None and info.status != "ok":
+        report.warnings.append(
+            "the final rebuild at head failed, so the repository's build output may still "
+            "reflect the reverted source: " + (info.note or info.status)
+        )
+
+
+def _repo_relative(repo: str, cwd: str, targets: list[str]) -> list[str]:
+    """Map package-relative targets back to repo-relative paths."""
+    prefix = os.path.relpath(cwd, repo).replace("\\", "/")
+    if prefix in ("", "."):
+        return list(targets)
+    return [f"{prefix}/{t}" for t in targets]
 
 
 def _timed_revert_all(
@@ -370,6 +513,122 @@ def _check_restored(
 
 
 # --------------------------------------------------------------------------
+# soundness: a NO_GATE may only rest on a proven mapping
+# --------------------------------------------------------------------------
+
+
+def _unproven_fixture_entries(report: Report) -> list[SelectionEntry]:
+    return [e for e in report.selection if e.targets and not e.proven]
+
+
+def _enforce_soundness(
+    repo, opts, report, base_sha, runner, tests, targets, report_dir, baseline
+) -> Report:
+    """Gate the *negative* verdict on evidence, and soften a deletion-only one.
+
+    ``GATE_HOLDS`` needs no extra proof: the tests demonstrably reacted to the
+    source revert, which is itself the proof that they exercise it. ``NO_GATE``
+    is the claim that nothing noticed, and that claim is only worth anything if
+    we know the tests we ran are the tests that read the changed files. Two ways
+    that can be false, and both are checked here:
+
+    * the changed file was a fixture and we merely *guessed* which module reads
+      it (sqlfluff #8221: guessed ``clickhouse_test.py``, real consumer
+      ``dialects_test.py``, 11 happily passing tests either way), and
+    * the tests read build output that no longer matches the reverted source.
+    """
+    if report.verdict is not Verdict.NO_GATE:
+        return report
+
+    if report.build_artifact_risk and runner.build_step is None:
+        return _inconclusive(
+            report,
+            f"the selected tests execute build output and no build step was detected, so the "
+            f"source revert may never have reached them: {report.build_artifact_risk}. A "
+            f"NO_GATE verdict here would be an artefact of a stale build, not a finding.",
+        )
+
+    unproven = _unproven_fixture_entries(report)
+    if unproven:
+        by_path = {f.path: f for f in tests}
+        fixtures = [by_path[e.source_file] for e in unproven if e.source_file in by_path]
+        probe = _probe_fixture_mapping(
+            repo, base_sha, fixtures, runner, targets, opts, report, report_dir, baseline
+        )
+        names = ", ".join(e.source_file for e in unproven)
+        if probe is None:
+            return _inconclusive(
+                report,
+                f"{UNPROVEN_FIXTURE_REASON}: {names}. The fixture could not be reverted on its "
+                f"own, so no evidence of a consumer could be gathered.",
+            )
+        report.probe_run = probe
+        if _runs_differ(report.head_run, probe):
+            report.probe_note = (
+                f"targeted probe: reverting {names} alone (source left at head) changed the "
+                f"selected tests' result from '{report.head_run.summary()}' to "
+                f"'{probe.summary()}', which proves the selection really does read the fixture"
+            )
+            for entry in unproven:
+                entry.proof = "targeted probe: reverting the fixture alone changed the outcome"
+            return report
+        report.probe_note = (
+            f"targeted probe: reverting {names} alone (source left at head) left every selected "
+            f"test's result unchanged ({probe.summary()}), so the selection does not read it"
+        )
+        return _inconclusive(
+            report,
+            f"{UNPROVEN_FIXTURE_REASON}: {names}. The tests we selected "
+            f"({', '.join(targets[:3])}{'...' if len(targets) > 3 else ''}) behave identically "
+            f"with that fixture reverted, so they cannot be the tests it gates and no NO_GATE "
+            f"conclusion can rest on them.",
+        )
+    return report
+
+
+def _probe_fixture_mapping(
+    repo, base_sha, fixtures, runner, targets, opts, report, report_dir, baseline
+) -> TestRunResult | None:
+    """Run the selection with only the fixture reverted, source untouched."""
+    if not fixtures:
+        return None
+    mutator = gitops.TreeMutator(repo, base_sha)
+    try:
+        with mutator:
+            mutator.revert(fixtures, kinds=(Kind.TEST,))
+            if not mutator.reverted:
+                return None
+            return runner.execute(targets, opts.timeout, report_dir, "fixture-probe")
+    finally:
+        _check_restored(repo, mutator, report, baseline)
+
+
+def _runs_differ(a: TestRunResult | None, b: TestRunResult | None) -> bool:
+    """Did anything at all about the run change? Counts and names, not just pass/fail."""
+    if a is None or b is None:
+        return True
+    if a.outcome is not b.outcome:
+        return True
+    if (a.passed, a.failed, a.errored, a.skipped) != (b.passed, b.failed, b.errored, b.skipped):
+        return True
+    return set(a.failing_ids + a.erroring_ids) != set(b.failing_ids + b.erroring_ids)
+
+
+def _soften_deletion_only(report: Report) -> Report:
+    """A PR that only deletes code cannot be gated by a test it did not add."""
+    source = report.source_files
+    if not source or report.verdict is not Verdict.NO_GATE:
+        return report
+    if not all(f.status == "D" for f in source):
+        return report
+    report.headline = (
+        "this PR only removes code; NO_GATE is expected if the removed behaviour had no other "
+        "coverage. " + report.headline
+    )
+    return report
+
+
+# --------------------------------------------------------------------------
 # dependency install
 # --------------------------------------------------------------------------
 
@@ -395,27 +654,42 @@ def _install_dependencies(
 
     if opts.install_command.strip():
         commands = depsmod.parse_override(opts.install_command)
-        plan = depsmod.InstallPlan(
-            detector="override",
-            evidence="an explicit install-command was supplied, so detection was skipped entirely",
-            commands=commands,
-            language=runner.language,
-        )
+        plans = [
+            depsmod.InstallPlan(
+                detector="override",
+                evidence=(
+                    "an explicit install-command was supplied, so detection was skipped entirely"
+                ),
+                commands=commands,
+                language=runner.language,
+            )
+        ]
         source = "override"
     else:
-        plan, note = depsmod.detect_install(repo, runner.language, _python_executable(runner))
+        plans, note = depsmod.detect_install_chain(
+            repo, runner.language, _python_executable(runner)
+        )
         source = "detected"
-        if plan is None:
+        if not plans:
             rep.source = "none"
             rep.status = "none"
             rep.evidence = note
             report.warnings.append(f"no dependency install was detected: {note}")
             return before
 
-    rep_run = depsmod.run_plan(repo, plan, opts.install_timeout)
+    rep_run = depsmod.run_plans(repo, plans, opts.install_timeout)
     rep_run.source = source
     rep_run.enabled = True
     report.install = rep = rep_run
+    if len(rep.attempts) > 1:
+        report.warnings.append(
+            "the first detected installer failed and the run fell back down the detection "
+            "table: "
+            + "; ".join(
+                f"{a['detector']} (`{(a['commands'] or [''])[0]}`) -> {a['status']}"
+                for a in rep.attempts
+            )
+        )
 
     after = gitops.TreeState.capture(repo)
     rep.artefacts = after.new_untracked_since(before)
@@ -466,15 +740,28 @@ def _refine(
     tests: list[ChangedFile],
     targets: list[str],
     entries: list[SelectionEntry],
-) -> tuple[list[str], list[SelectionEntry]]:
-    """Try to narrow each selection entry to the tests the PR actually added."""
+) -> tuple[list[str], list[SelectionEntry], list[str] | None]:
+    """Narrow each selection entry to the tests the PR actually added, and -
+    the part that matters - record *why* we believe each entry's targets are
+    the tests that read the changed file.
+
+    Evidence, strongest first:
+
+    1. the collected node ids literally contain the fixture's own file name or
+       stem (an auto-discovery harness parametrises on the file name, so this
+       is what proves ``dialects_test.py`` reads ``exchange.sql``);
+    2. the collected node ids contain a case key the PR *added* to a modified
+       fixture (this is the sqlfluff #8201 path and it stays exactly as it was);
+    3. nothing - the entry stays unproven and a NO_GATE built on it will be
+       downgraded later by :func:`_enforce_soundness`.
+    """
     collected = runner.collect(targets, min(opts.timeout, 300))
     if collected is None:
         report.warnings.append(
             f"the {runner.id} runner cannot enumerate tests, so the whole selected test "
             f"file(s) were run rather than only the tests this PR added"
         )
-        return targets, entries
+        return targets, entries, None
 
     by_file = {f.path: f for f in tests}
     new_targets: list[str] = []
@@ -485,7 +772,12 @@ def _refine(
         proposal: list[str] = []
         method = entry.method
         detail = entry.detail
+        proof = entry.proof
 
+        # Ids proposed for a fixture entry are read straight out of a real
+        # collection, so they need no second validation pass; ids derived from
+        # a test file's AST do.
+        validate = True
         if f is not None and f.executable_test and entry.targets:
             changed = refine.changed_line_numbers(repo, base_sha, report.head_sha, f.path)
             head_text = hunkmod.read_head_text(repo, report.head_sha, f.path)
@@ -495,21 +787,19 @@ def _refine(
                     method = "direct+changed-tests"
                     detail = f"only the {len(proposal)} test(s) this PR added or modified"
         elif f is not None and not f.executable_test and entry.targets:
-            keys = refine.added_fixture_keys(repo, base_sha, report.head_sha, f.path)
-            if keys:
-                hits = refine.filter_collected_by_keys(collected, keys)
-                if hits:
-                    proposal = hits
-                    method = entry.method + "+added-cases"
-                    detail = (
-                        f"{entry.detail}; narrowed to the {len(hits)} collected case(s) matching "
-                        f"the {len(keys)} fixture key(s) this PR added"
-                    )
+            proposal, method, detail, proof = _prove_fixture_entry(
+                repo, runner, opts, report, base_sha, f, entry, collected
+            )
+            validate = False
 
         if proposal:
-            kept = refine.verify_against_collection(proposal, collected)
+            kept = refine.verify_against_collection(proposal, collected) if validate else proposal
             if kept:
-                new_entries.append(SelectionEntry(entry.source_file, kept, method, detail))
+                new_entries.append(
+                    SelectionEntry(
+                        entry.source_file, kept, method, detail, proof, entry.harness_targets
+                    )
+                )
                 for t in kept:
                     if t not in new_targets:
                         new_targets.append(t)
@@ -524,7 +814,64 @@ def _refine(
             if t not in new_targets:
                 new_targets.append(t)
 
-    return new_targets, new_entries
+    return new_targets, new_entries, collected
+
+
+def _prove_fixture_entry(
+    repo, runner, opts, report, base_sha, f: ChangedFile, entry: SelectionEntry, collected
+) -> tuple[list[str], str, str, str]:
+    """Return ``(targets, method, detail, proof)`` for one changed fixture."""
+    stem = refine.fixture_stem(f.path)
+
+    # A harness never names the fixture, so its cases may not be in `collected`
+    # if the harness module was only just added to the selection. Ask the runner
+    # for them directly with -k <stem>, which is cheap and exact.
+    pool = list(collected)
+    if entry.harness_targets and stem.replace("_", "").isalnum():
+        extra = runner.collect(entry.harness_targets, min(opts.timeout, 300), ["-k", stem])
+        for nid in extra or []:
+            if nid not in pool:
+                pool.append(nid)
+
+    stem_hits, how = refine.filter_collected_by_stem(pool, f.path)
+
+    # Added-case keys are evidence only for a *modified* fixture. For a file the
+    # PR created wholesale every key is "added", including structural ones like
+    # `file:`, and matching on those selects tests at random.
+    keys = (
+        refine.added_fixture_keys(repo, base_sha, report.head_sha, f.path)
+        if f.status == "M"
+        else []
+    )
+    key_hits = refine.filter_collected_by_keys(pool, keys) if keys else []
+
+    if stem_hits and key_hits:
+        both = [nid for nid in stem_hits if nid in set(key_hits)]
+        if both:
+            return (
+                both,
+                entry.method + "+added-cases",
+                f"{entry.detail}; narrowed to the {len(both)} collected case(s) that name the "
+                f"fixture and match the {len(keys)} case key(s) this PR added",
+                f"{how} and a case key this PR added",
+            )
+    if stem_hits:
+        return (
+            stem_hits,
+            entry.method + "+named-cases",
+            f"{entry.detail}; narrowed to the {len(stem_hits)} collected case(s) that name "
+            f"the fixture",
+            how,
+        )
+    if key_hits:
+        return (
+            key_hits,
+            entry.method + "+added-cases",
+            f"{entry.detail}; narrowed to the {len(key_hits)} collected case(s) matching the "
+            f"{len(keys)} fixture key(s) this PR added",
+            f"the collected test id(s) contain case key(s) this PR added to the fixture",
+        )
+    return [], entry.method, entry.detail, ""
 
 
 # --------------------------------------------------------------------------

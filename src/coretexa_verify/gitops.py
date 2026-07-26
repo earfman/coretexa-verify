@@ -284,10 +284,16 @@ class TreeMutator:
         else:
             self._backed_up.append((rel, None))
 
-    def revert(self, files: list[ChangedFile]) -> None:
-        """Restore SOURCE files to their base-commit content, in place."""
+    def revert(self, files: list[ChangedFile], kinds: tuple = (Kind.SOURCE,)) -> None:
+        """Restore files of the given kinds to their base-commit content, in place.
+
+        ``kinds`` defaults to SOURCE, which is the experiment. The fixture probe
+        passes TEST instead, to revert a fixture on its own and see whether the
+        selected tests notice - that is the only way to *prove* a fixture is
+        actually consumed by the tests we chose.
+        """
         for f in files:
-            if f.kind is not Kind.SOURCE:
+            if f.kind not in kinds:
                 continue
             targets = [f.path] if f.old_path is None else [f.path, f.old_path]
             for rel in targets:
