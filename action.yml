@@ -50,6 +50,10 @@ inputs:
     description: "Timeout in seconds for each dependency-install command."
     required: false
     default: "600"
+  max-collected:
+    description: "Refuse to run when a widened selection collects more than this many tests."
+    required: false
+    default: "500"
   localize:
     description: >-
       Per-hunk localisation. auto (default) drills into individual hunks only
@@ -105,6 +109,7 @@ runs:
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_LOCALIZE: ${{ inputs.localize }}
+        INPUT_MAX_COLLECTED: ${{ inputs.max-collected }}
         INPUT_INSTALL_DEPS: ${{ inputs.install-deps }}
         INPUT_INSTALL_COMMAND: ${{ inputs.install-command }}
         INPUT_INSTALL_TIMEOUT: ${{ inputs.install-timeout }}

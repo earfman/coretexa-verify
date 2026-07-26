@@ -26,22 +26,6 @@ tests still passing: cmscontrib/loaders/italy_yaml.py hunk 2 (head lines
 
 ---
 
----
-
-## Known issues — read this before you trust a verdict (2026-07-26)
-
-Field-tested against 16 real pull requests across six repositories. Two results you should know about:
-
-**1. `NO_GATE` can be wrong on fixture-corpus suites.** On [sqlfluff#8221](https://github.com/sqlfluff/sqlfluff/pull/8221) the tool reported `NO_GATE`; the PR's own new fixture *does* fail when the source is reverted. Cause: when a changed fixture is mapped to its consumer by literal-string search, a suite that auto-discovers fixtures (and therefore never names them) is structurally unselectable, so the search matched a *different* file that passes either way. The documented safe fallback only triggers when the search finds nothing — here it found the wrong thing. Affects parser/linter/formatter projects with fixture corpora. **Until this is fixed, treat `NO_GATE` on a fixture-driven repo as "look yourself", not as a finding.**
-
-**2. 62.5% of real PRs came back `INCONCLUSIVE` out of the box.** Roughly half of those are ours, not your repo's: JS/TS monorepos are run from the repo root instead of the owning workspace package (every TS monorepo PR tested was inconclusive), `uv sync --frozen` has no pip fallback when it fails on a version pin, and the whole-suite directory fallback isn't bounded by collected-test count so it can run for fifteen minutes and time out.
-
-What did hold up: two verdicts hand-verified independently and both correct, including a genuinely non-obvious `NO_GATE` on [httpx#3777](https://github.com/encode/httpx/pull/3777); dependency auto-install fired correctly on all 22 runs; and zero tree corruption across every run including timeouts and failed installs.
-
-Fixes for 1 and 2 are the next work. Issues and counterexamples welcome — a wrong verdict is the most useful bug report you can send.
-
----
-
 ## Quick start (GitHub Action)
 
 Paste one file. There is no step to write.
@@ -113,6 +97,7 @@ gets turned off on its second. Opt in with `fail-on` when you trust it.
 | `fail-on` | `never` | `never`, `no-gate`, `no-gate-or-inconclusive`, `not-gate-holds` |
 | `timeout` | `900` | per test-run timeout, in seconds |
 | `localize` | `auto` | `auto`, `always`, `never` — see [Localisation](#localisation) |
+| `max-collected` | `500` | refuse to run when a widened selection collects more than this many tests |
 | `install-deps` | `true` | detect and install the repo's own test dependencies — see [Dependency install](#dependency-install) |
 | `install-command` | *(none)* | explicit install command; overrides detection entirely |
 | `install-timeout` | `600` | timeout for each install command, in seconds |
@@ -142,7 +127,8 @@ python -m coretexa_verify --repo . --base origin/main --json
 ```
 
 Useful flags: `--json`, `--markdown`, `--timeout`, `--localize`, `--no-refine`,
-`--test-glob`, `--source-glob`, `--fail-on`, `--runner-arg`.
+`--test-glob`, `--source-glob`, `--fail-on`, `--runner-arg`, `--max-targets`,
+`--max-collected`.
 
 Dependency install: `--install-deps` / `--no-install-deps` (default: on),
 `--install-command CMD`, `--install-timeout SECONDS` (default: 600). These are
@@ -178,21 +164,49 @@ the same three controls as the Action inputs, under the same names.
 
 ### Test selection
 
-Changed test files are handed to the runner directly. But two refinements make
-the result mean what you think it means, and both are **verified by asking the
-runner to collect them** — nothing is ever guessed:
+Changed test files are handed to the runner directly. But three refinements make
+the result mean what you think it means, and all of them are **verified by asking
+the runner to collect them** — nothing is ever guessed:
 
 - **Only the tests this PR added.** The diff's changed line numbers are
   intersected with the test file's AST, so a neighbouring legacy test that hits
   the network cannot turn a good run into `INCONCLUSIVE`.
-- **Only the fixture cases this PR added.** For YAML/JSON fixtures, the top-level
-  keys the PR added are matched against collected parametrised test ids. On
-  sqlfluff this turned a 2,313-case, multi-minute suite into the 10 cases the PR
-  is actually about.
+- **Only the fixture cases this PR added.** For a *modified* YAML/JSON fixture,
+  the top-level keys the PR added are matched against collected parametrised test
+  ids. On sqlfluff this turned a 2,313-case, multi-minute suite into the 10 cases
+  the PR is actually about.
+- **Auto-discovery harnesses.** Many suites build their cases by *enumerating a
+  fixture directory* — `glob`, `os.walk`, `os.listdir`, a `parametrize` over a
+  directory listing — so the consuming module never contains the fixture's name
+  and a literal search cannot find it. We therefore also search test modules for
+  references to the fixture's **ancestor directories**, in every spelling
+  (`test/fixtures/dialects`, `"test", "fixtures", "dialects"`, `fixtures/dialects`),
+  and treat a module that both references the fixture root *and* enumerates a
+  directory as a candidate consumer. Those candidates are then collected with
+  `-k <fixture stem>` to find the exact parametrised cases.
 
-If a changed fixture cannot be mapped to a consuming test module, the enclosing
-test directory is run instead **and the report says so** — a silent widening of
-scope would change what the verdict means.
+#### Proof, not guesswork
+
+Every selection entry carries a `proof` field, and the report prints it. It is
+non-empty only when the link between the changed file and the tests we ran was
+**established**:
+
+1. the collected node ids are *parametrised on* the fixture's file name or stem,
+   or on a case key the PR added; or
+2. a **targeted probe** — the fixture is reverted on its own, with the source left
+   at head, and the selection is re-run. If nothing about the result changes, the
+   selection provably does not read the fixture.
+
+A `GATE_HOLDS` needs no extra proof: the tests demonstrably reacted to the source
+revert, which *is* the proof. A `NO_GATE` is the claim that nothing noticed, and
+that claim is only worth something if the tests we ran are the tests that read the
+changed files — so **a `NO_GATE` that rests on an unproven mapping is downgraded
+to `INCONCLUSIVE`** with the reason *"changed test fixture could not be provably
+mapped to a consuming test"*.
+
+If a changed fixture cannot be mapped to a consuming test module at all, the
+enclosing test directory is run instead **and the report says so** — a silent
+widening of scope would change what the verdict means.
 
 ### Localisation
 
@@ -497,22 +511,116 @@ still read as `GATE_HOLDS`.
   pytest/jest/vitest today.
 - A changed fixture that cannot be mapped to a consumer and has no enclosing test
   directory.
-- Selection that widens past `--max-targets` (default 50).
+- A changed fixture whose mapping to a consuming test could not be *proven* —
+  see [Proof, not guesswork](#proof-not-guesswork). Downgraded from `NO_GATE`,
+  never reported as one.
+- Selection that widens to more than `--max-targets` (default 50) whole
+  files/directories, or that **collects** more than `--max-collected` tests
+  (default 500). The second limit is the one that matters: a single bare
+  directory target is one argument and six thousand tests.
+- Tests that execute build output where no build step could be detected, when the
+  verdict would otherwise have been `NO_GATE`.
 - Any run that times out; the timeout is reported, never swallowed.
 - A dirty working tree — we refuse to start rather than risk not restoring it.
 - A shallow clone with no merge base (use `fetch-depth: 0`).
 
-### PR shapes where it can mislead
+## Known issues
+
+### Fixed in 1.2.0
+
+The 1.1.0 field test surfaced two classes of defect that are now closed.
+
+**False `NO_GATE` from a guessed fixture mapping — fixed.** In 1.1.0 a changed
+fixture was mapped to a consuming test by literal search alone. On
+[sqlfluff#8221](https://github.com/sqlfluff/sqlfluff/pull/8221) — which adds
+`test/fixtures/dialects/clickhouse/exchange.sql|yml` plus the ClickHouse dialect
+support that makes them parse — that search matched
+`test/dialects/clickhouse_test.py`, eleven tests that pass whether or not the fix
+is present, and 1.1.0 emitted a confident `NO_GATE`. The real consumer is
+`test/dialects/dialects_test.py`, which auto-discovers `test/fixtures/dialects/**`
+and contains the literal `clickhouse` exactly zero times.
+
+Three changes close this:
+
+1. **Harness discovery.** Test modules are searched for references to the
+   fixture's *ancestor directories* and for directory-enumerating constructs, so
+   `dialects_test.py` is found even though it never names the fixture.
+2. **Proof-carrying selection.** A mapping counts only when the collected node ids
+   are parametrised on the fixture's name/stem or on a case key the PR added.
+3. **A targeted probe.** If a mapping is still unproven and the verdict would be
+   `NO_GATE`, the fixture is reverted *on its own* with the source left at head
+   and the selection is re-run. No change in outcome means the selection does not
+   read the fixture, and the verdict degrades to `INCONCLUSIVE` — never `NO_GATE`.
+
+sqlfluff#8221 re-run on 1.2.0:
+
+```
+[ok] GATE_HOLDS
+Reverting src/sqlfluff/dialects/dialect_clickhouse.py,
+src/sqlfluff/dialects/dialect_clickhouse_keywords.py makes 3 of the PR's
+test(s) fail: the tests really do gate the change.
+
+test/fixtures/dialects/clickhouse/exchange.sql
+  -> test/dialects/dialects_test.py::test__dialect__base_file_parse[clickhouse-exchange.sql],
+     test/dialects/dialects_test.py::test__dialect__base_broad_fix[clickhouse-exchange.sql],
+     test/dialects/dialects_test.py::test__dialect__base_parse_struct[clickhouse-exchange.sql-True-exchange.yml],
+     ...                                       [fixture-map+harness+named-cases]
+     proof: the collected test id(s) are parametrised on the fixture file name
+            'exchange.sql'
+```
+
+23 s, three real failures on revert — the same three the PR author would see from
+`pytest test/dialects/dialects_test.py -k exchange`.
+
+**JS/TS monorepos returning `INCONCLUSIVE` — fixed.** 1.1.0 ran every JavaScript
+suite from the repository root, where a workspace package's runner config does not
+apply, so every monorepo suite failed to transform before a single assertion ran.
+1.2.0 detects workspaces (`workspaces` in package.json, `pnpm-workspace.yaml`),
+maps each changed test to its **owning package** (nearest ancestor package.json),
+runs the tests from that package directory with that package's own config, and
+detects the repo's build script (`build:all`, `build`, …) — running it before the
+head run **and again inside every revert**, so tests that import build output see
+the reverted source. modelcontextprotocol/typescript-sdk
+[#2540](https://github.com/modelcontextprotocol/typescript-sdk/pull/2540) and
+[#2550](https://github.com/modelcontextprotocol/typescript-sdk/pull/2550) both
+reach `GATE_HOLDS` out of the box, with no `--install-command` and no
+`--runner-arg`; #2550 needed manual flags in 1.1.0 and was `INCONCLUSIVE` even
+with them.
+
+Also fixed: the installer now falls back down the detection table when the
+first-choice installer fails (and reports every attempt); a widened selection is
+bounded by **collected test count** rather than target count, which turns
+sqlfluff#8222's 939-second timeout into a 71-second `GATE_HOLDS`; running as
+uid 0 is warned about; and a deletion-only PR's `NO_GATE` headline says so.
+
+### Limitations
+
+These are real and they remain.
 
 - **Tests split across files.** If the PR changes `src/a.py` and adds
   `tests/test_b.py` that only covers something else, we run the changed test file
   and may report `NO_GATE` when the real gate is an existing untouched test. The
   question we answer is about the PR's *own* tests, by design — but the headline
   can read as a broader claim than it is.
-- **Fixture mapping via literal search.** We look for test modules containing a
-  literal reference to the fixture's path, directory or stem. A test suite that
-  discovers fixtures purely dynamically will fall through to the
-  directory-fallback (reported) or fail to select (`INCONCLUSIVE`).
+- **Root user.** Running as uid 0 makes every permission-based assertion
+  unfailable, so such a test cannot detect a revert. We warn; we cannot fix it.
+  Run the Action as a non-root user if your suite tests permissions.
+- **System build dependencies.** A wheel needing C headers (`psycopg2` wants
+  libpq, `pycups` wants CUPS) will not build on a bare runner. The fallback chain
+  makes this fail *informatively* — both attempts are in the report — but it does
+  not make the tests runnable. Add an `apt-get` step.
+- **conda / mamba environments** are not detected at all. Use `install-command`.
+- **Languages other than Python and JavaScript/TypeScript.** Go, Rust, Java, C++,
+  Ruby and .NET produce `INCONCLUSIVE` — no runner is detected. Adding one is a
+  detector function plus a registry entry.
+- **Build artefacts beyond what we re-run.** We re-run a *detected* build step
+  around every mutation, and we refuse `NO_GATE` when the selected tests import
+  build output and no build step was found. Two gaps remain: a build produced by
+  something we do not recognise as a build script (a Makefile, a custom shell
+  step, `cargo build` behind a Python extension), and an incremental build whose
+  cache does not invalidate on the reverted file. Compiled Python sources
+  (`.pyx`, `.c`, `.rs`) are flagged as a risk but there is no Python build step
+  we re-run, so those PRs are refused rather than answered.
 - **JavaScript refinement is absent.** jest and vitest cannot cheaply enumerate
   tests for us, so JS/TS runs execute the whole changed test file. Legacy tests in
   that file can cause `INCONCLUSIVE`. This is stated in the report's warnings.
@@ -523,6 +631,9 @@ still read as `GATE_HOLDS`.
 - **Type-only and compile-level fixes** can only ever produce
   `GATE_HOLDS_BUILD`, and JS runners do not typecheck at all, so a TypeScript
   type fix may look like `NO_GATE` under vitest/jest. Run `tsc` separately.
+- **Multi-package selections.** When a PR's changed tests span two workspace
+  packages we fall back to running from the repository root, which is the shape
+  that used to fail. Such a PR may still be `INCONCLUSIVE`.
 - **Non-hermetic tests.** A test that writes into the repository, caches to disk,
   or depends on run order can make the second run differ from the first for
   reasons that have nothing to do with the revert.
@@ -531,6 +642,11 @@ still read as `GATE_HOLDS`.
   interesting.
 - **Renames and whole-file additions are skipped during localisation**, because
   there is no meaningful intermediate state to revert one hunk of.
+- **Harness discovery is bounded.** A module qualifies only if it references an
+  ancestor directory of the fixture *and* contains a directory-enumerating
+  construct. A harness that computes its fixture root from configuration, or that
+  lives more than one `conftest.py` hop away from its tests, will not be found —
+  in which case the probe refuses `NO_GATE` rather than guessing.
 
 ### Repo shapes where the dependency install will not help
 
@@ -555,9 +671,11 @@ so and the verdict is `INCONCLUSIVE` rather than wrong — but you will want
   style invocations. We run a plain `poetry install`.
 - **Yarn Berry (v2+)** rejects `--frozen-lockfile`; it wants `--immutable`. A
   yarn 2/3/4 repo needs `install-command: yarn install --immutable`.
-- **Monorepos and workspaces.** We install at the repository root. A package
-  living in `packages/foo` with its own manifest is not installed, and
-  `working-directory` is the lever for that.
+- **Monorepos and workspaces.** We install at the repository root, which is
+  correct for pnpm/yarn/npm workspaces — the installer is workspace-aware and
+  links every package. Since 1.2.0 the *tests* are then run from the package that
+  owns them. A package with its own manifest outside the declared workspace globs
+  is still not installed.
 - **Multi-language repos.** We install for the language of the *detected test
   runner* only. A Python repo whose tests shell out to a JS build gets the
   Python half and nothing else.
