@@ -27,10 +27,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install pytest
+      # No setup-python, no pip install: the Action installs this repo's own
+      # declared test dependencies itself. That is the feature, dogfooded.
       - uses: ./
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
