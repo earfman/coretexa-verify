@@ -134,6 +134,29 @@ Dependency install: `--install-deps` / `--no-install-deps` (default: on),
 `--install-command CMD`, `--install-timeout SECONDS` (default: 600). These are
 the same three controls as the Action inputs, under the same names.
 
+### Give the target repository its own `.venv`
+
+**On the command line, prefer a repo-local environment.** The pytest runner picks
+its interpreter in this order: `uv run` (when `uv.lock` is committed and `uv` is
+on `PATH`), then `.venv/bin/python`, then `venv/bin/python`, and only then the
+interpreter coretexa-verify itself is installed in. That last case is a real
+decision with a real consequence: `--install-deps` (on by default) will install
+the *target repository's* test dependencies into **your** environment — the same
+one the tool lives in.
+
+The tool says so loudly when it happens: the runner reason names the actual
+interpreter path rather than a comfortable-looking `python -m pytest`, and a
+warning appears in the report. To avoid it entirely:
+
+```bash
+cd /path/to/target-repo
+python -m venv .venv          # coretexa-verify will find and use this
+python -m coretexa_verify --repo . --base origin/main --head HEAD
+```
+
+Or pass `--no-install-deps` and prepare the environment yourself. In the GitHub
+Action this is a non-issue: the runner is disposable.
+
 ---
 
 ## The verdicts
@@ -520,6 +543,10 @@ still read as `GATE_HOLDS`.
   directory target is one argument and six thousand tests.
 - Tests that execute build output where no build step could be detected, when the
   verdict would otherwise have been `NO_GATE`.
+- **Selected tests that all skip.** pytest and vitest exit 0 when 100% of the
+  selected tests skip, so `0 passed, N skipped` looks like success. No verdict
+  may rest on a run that executed nothing, so this is `INCONCLUSIVE` with the
+  count. Where *some* tests skipped, every headline says how many.
 - Any run that times out; the timeout is reported, never swallowed.
 - A dirty working tree — we refuse to start rather than risk not restoring it.
 - A shallow clone with no merge base (use `fetch-depth: 0`).
@@ -642,6 +669,15 @@ These are real and they remain.
   interesting.
 - **Renames and whole-file additions are skipped during localisation**, because
   there is no meaningful intermediate state to revert one hunk of.
+- **Skipped tests are not evidence.** We refuse a verdict when nothing executed
+  and we report the skip count when some did, but we cannot tell you *why* a
+  test skipped or make it run. A suite that skips most of itself on your runner
+  is testing much less than its name suggests.
+- **Per-hunk runs that break the runner cannot be judged.** If reverting one hunk
+  in isolation produces code the runner refuses to start on (pytest exit 4, no
+  report), that hunk is reported `UNKNOWN` and excluded from every count. It is
+  neither counted as gated nor as ungated, so a coordinated multi-hunk change may
+  leave part of the diff genuinely unevaluated.
 - **Harness discovery is bounded.** A module qualifies only if it references an
   ancestor directory of the fixture *and* contains a directory-enumerating
   construct. A harness that computes its fixture root from configuration, or that
