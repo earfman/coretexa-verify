@@ -1108,7 +1108,7 @@ Report a security issue by opening an issue at
 ```bash
 git clone https://github.com/earfman/coretexa-verify
 cd coretexa-verify
-PYTHONPATH=src python -m pytest tests -q     # 504 tests, no network required
+PYTHONPATH=src python -m pytest tests -q     # 507 tests, no network required
 ```
 
 Layout:

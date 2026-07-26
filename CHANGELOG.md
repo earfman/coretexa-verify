@@ -2,6 +2,21 @@
 
 All notable changes to coretexa-verify. Newest first.
 
+## 1.3.3
+
+### Fixed
+
+- **Repeat runs on the same checkout no longer degrade to `INCONCLUSIVE`.** A
+  build or test run routinely rewrites a tracked lockfile - `go mod download`
+  refreshes `go.work.sum`, cargo touches `Cargo.lock`. The cleanliness gate
+  correctly refuses to run against a dirty tree, so leaving that dirt behind
+  meant the *second* pull request verified in a given clone aborted for a reason
+  that had nothing to do with it. Tracked files dirtied during the run are now
+  restored at the end. The gate itself is unchanged: a tree that was already
+  dirty when you invoked the tool is still refused, and a user's uncommitted
+  work is never touched. Found while scouting knadh/koanf, where three of four
+  PRs in a sweep died on a `go.work.sum` we had modified ourselves.
+
 ## 1.3.2
 
 - **Security: token isolation.** No credential in the job's environment reaches
