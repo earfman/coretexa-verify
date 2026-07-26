@@ -44,6 +44,14 @@ GENERIC_DIR_NAMES = frozenset(
 #: More consumers than this and the token is too vague to trust.
 MAX_CONSUMERS = 8
 
+#: Harness discovery is allowed a wider net than the literal search, because
+#: its signal is much more specific (an ancestor-directory reference *and* a
+#: directory-enumerating construct) and because the result is then narrowed to
+#: individual cases by collecting with ``-k <fixture stem>``. sqlfluff's
+#: fixtures/dialects root has 16 such consumers; capping at 8 threw all of them
+#: away rather than narrowing them.
+MAX_HARNESS_CONSUMERS = 24
+
 #: Source constructs that mean "this module builds its cases by enumerating a
 #: directory rather than by naming files". Presence of one of these *plus* a
 #: reference to an ancestor directory of the fixture is what makes a module an
@@ -135,19 +143,32 @@ def ancestor_dirs(path: str) -> list[str]:
     return out
 
 
+#: How a fixture root gets spelled in real test modules. Each entry is a
+#: separator placed between quoted path components:
+#:
+#:   ``os.path.join("test", "fixtures", "dialects")``  -> ``", "``
+#:   ``Path(__file__).parent / "test" / "fixtures"``   -> ``" / "``
+#:   ``ROOT / "test"/"fixtures"``                      -> ``"/"``
+#:
+#: Missing the pathlib spelling is what hid sqlfluff's ``rust_parser_test.py``,
+#: which declares its root as ``Path(...) / "test" / "fixtures" / "dialects"``.
+COMPONENT_SEPARATORS = (", ", " / ", "/")
+
+
 def directory_reference_forms(directory: str) -> list[str]:
     """Literal spellings a test module might use to name ``directory``.
 
-    Covers the plain path (``test/fixtures/dialects``), the ``os.path.join``
-    spelling (``"test", "fixtures", "dialects"``) and the trailing two
-    components, which is how a module usually refers to a fixture root that
-    lives under a repo-specific prefix.
+    Covers the plain path (``test/fixtures/dialects``), the quoted-component
+    spellings above in both quote styles, and the trailing two components,
+    which is how a module usually refers to a fixture root that lives under a
+    repo-specific prefix.
     """
     parts = [p for p in directory.split("/") if p]
     forms = [directory, directory + "/"]
     if len(parts) >= 2:
         for quote in ('"', "'"):
-            forms.append(", ".join(f"{quote}{p}{quote}" for p in parts))
+            for sep in COMPONENT_SEPARATORS:
+                forms.append(sep.join(f"{quote}{p}{quote}" for p in parts))
         forms.append("/".join(parts[-2:]))
     seen: set[str] = set()
     ordered = []
@@ -204,7 +225,7 @@ def find_harness_consumers(
                         conftests.append(path)
                 elif path not in hits:
                     hits.append(path)
-        if hits and len(hits) <= MAX_CONSUMERS:
+        if hits and len(hits) <= MAX_HARNESS_CONSUMERS:
             return (
                 sorted(hits),
                 f"test module(s) that enumerate the fixture directory "
@@ -212,7 +233,7 @@ def find_harness_consumers(
             )
         if conftests:
             expanded = _modules_using_conftest(repo, conftests, executable_tests)
-            if expanded and len(expanded) <= MAX_CONSUMERS:
+            if expanded and len(expanded) <= MAX_HARNESS_CONSUMERS:
                 return (
                     sorted(expanded),
                     f"test module(s) importing {', '.join(conftests)}, which enumerates "

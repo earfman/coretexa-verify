@@ -121,7 +121,7 @@ def render_text(report: Report, color: bool = False) -> str:
         lines.append("")
         lines.append("per-hunk localisation (each hunk reverted on its own)")
         for h in report.hunk_results:
-            mark = "GATED    " if h.gated else "UNGATED  "
+            mark = {"gated": "GATED    ", "ungated": "UNGATED  ", "unknown": "UNKNOWN  "}[h.status]
             lines.append(f"  {mark} {h.label}")
             lines.append(f"            {h.outcome.value}: {h.summary}")
             for fid in h.failing_ids[:3]:
@@ -225,17 +225,24 @@ def render_markdown(report: Report) -> str:
         out.append("")
 
     if report.hunk_results:
-        ungated = [h for h in report.hunk_results if not h.gated]
+        ungated = [h for h in report.hunk_results if h.status == "ungated"]
+        unknown = [h for h in report.hunk_results if h.status == "unknown"]
+        extra = f", {len(unknown)} not evaluable" if unknown else ""
         out.append(
             f"<details{' open' if ungated else ''}><summary>Per-hunk localisation "
-            f"({len(ungated)} of {len(report.hunk_results)} behavioural change(s) ungated)</summary>"
+            f"({len(ungated)} of {len(report.hunk_results)} behavioural change(s) ungated"
+            f"{extra})</summary>"
         )
         out.append("")
         out.append("| hunk | reverted alone | result |")
         out.append("|---|---|---|")
+        flags = {
+            "ungated": "🚨 **not detected**",
+            "gated": "detected",
+            "unknown": "❔ **not evaluated** (the runner itself failed)",
+        }
         for h in report.hunk_results:
-            flag = "🚨 **not detected**" if not h.gated else "detected"
-            out.append(f"| `{h.label}` | {flag} | {h.outcome.value}: {h.summary} |")
+            out.append(f"| `{h.label}` | {flags[h.status]} | {h.outcome.value}: {h.summary} |")
         if ungated:
             out.append("")
             for h in ungated:

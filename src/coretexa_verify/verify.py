@@ -67,7 +67,7 @@ from .runners import DetectionFailed, Runner, detect_runner
 from .runners.javascript import detect_build_step
 from .selection import classify_all, select_targets
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 #: Reason attached to a verdict that had to be downgraded because a changed
 #: fixture could not be tied to a test that reads it. Quoted in the README.
@@ -206,6 +206,7 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
     except DetectionFailed as exc:
         return _inconclusive(report, str(exc))
     report.runner = runner.info
+    report.warnings.extend(runner.setup_warnings)
 
     # ---- dependency install ------------------------------------------------
     # Deliberately here: after the cleanliness gate (so generated artefacts can
@@ -304,6 +305,8 @@ def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
             report.head_run = head_run
             if head_run.outcome is not Outcome.PASS:
                 return _inconclusive(report, _head_failure_reason(head_run, report.install))
+            if head_run.executed == 0:
+                return _inconclusive(report, _all_skipped_reason(head_run))
 
             # ---- stage 1: revert every source file ------------------------
             mutated_build = runner.build_step is not None
@@ -352,6 +355,13 @@ def _collection_cap(
     costs one ``--collect-only`` and refuses in seconds.
     """
     widened_by = [e.source_file for e in entries if e.is_fallback]
+    # An unnarrowed harness selection is a widening too: it is a pile of whole
+    # test modules chosen because they enumerate a directory, not because they
+    # were shown to read this fixture.
+    widened_by += [
+        e.source_file for e in entries
+        if e.harness_targets and not e.proven and e.source_file not in widened_by
+    ]
     bare_dirs = [
         t for t in targets
         if "::" not in t and os.path.isdir(os.path.join(repo, t))
@@ -482,7 +492,10 @@ def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir,
                 header=hunk.header,
                 label=hunk.short_label,
                 outcome=run.outcome,
-                gated=run.outcome is not Outcome.PASS,
+                # A runner usage error, a timeout or an empty collection means
+                # the experiment did not happen. Calling that "gated" lets a
+                # broken command stand in for a test that noticed something.
+                gated=run.outcome in (Outcome.ASSERT_FAIL, Outcome.BUILD_ERROR),
                 summary=run.summary(),
                 preview=hunk.preview(),
                 failing_ids=(run.failing_ids + run.erroring_ids)[:5],
@@ -517,6 +530,35 @@ def _check_restored(
 # --------------------------------------------------------------------------
 
 
+def _all_skipped_reason(run: TestRunResult) -> str:
+    """The precondition nobody thought to check: did anything actually run?
+
+    pytest (and vitest) exit 0 when every selected test skips, and the JUnit
+    report then says ``0 passed, N skipped``. Reverting the source and getting
+    the same ``0 passed, N skipped`` back is not evidence that the tests do not
+    gate the change - it is evidence that no test ran at all. sqlfluff #8225 was
+    exactly this shape: head and reverted both "12 passed, 52 skipped" because
+    the Rust parser the skipped tests need was never built.
+    """
+    return (
+        f"all {run.skipped} selected test(s) were skipped - nothing executed, so reverting "
+        f"the source could not have been detected by anything. A skip is not a passing test: "
+        f"the usual causes are a missing optional dependency, a platform guard, an absent "
+        f"service, or a build artefact the suite needs and does not have."
+    )
+
+
+def _skip_note(report: Report) -> str:
+    """A sentence naming the skipped tests, for any headline that has some."""
+    run = report.head_run
+    if run is None or not run.skipped:
+        return ""
+    return (
+        f" {run.skipped} of the {run.skipped + run.executed} selected test(s) were skipped and "
+        f"never executed; the verdict rests only on the {run.executed} that ran."
+    )
+
+
 def _unproven_fixture_entries(report: Report) -> list[SelectionEntry]:
     return [e for e in report.selection if e.targets and not e.proven]
 
@@ -536,7 +578,16 @@ def _enforce_soundness(
       it (sqlfluff #8221: guessed ``clickhouse_test.py``, real consumer
       ``dialects_test.py``, 11 happily passing tests either way), and
     * the tests read build output that no longer matches the reverted source.
+
+    A third check applies to *both* signs of verdict: neither ``NO_GATE`` nor
+    ``GATE_HOLDS`` may be claimed from a run in which nothing executed.
     """
+    if report.verdict in (Verdict.NO_GATE, Verdict.GATE_HOLDS, Verdict.GATE_HOLDS_BUILD):
+        head = report.head_run
+        if head is not None and head.executed == 0:
+            return _inconclusive(report, _all_skipped_reason(head))
+        report.headline += _skip_note(report)
+
     if report.verdict is not Verdict.NO_GATE:
         return report
 
@@ -809,12 +860,38 @@ def _refine(
                 f"fell back to the whole test file"
             )
 
+        # A harness module earns its place in the selection by yielding the
+        # fixture's own cases. If narrowing found none, running the whole
+        # harness is a large, unproven widening - so drop it back out whenever
+        # a literal consumer remains to run instead.
+        entry = _prune_unnarrowed_harness(entry, report)
         new_entries.append(entry)
         for t in entry.targets:
             if t not in new_targets:
                 new_targets.append(t)
 
     return new_targets, new_entries, collected
+
+
+def _prune_unnarrowed_harness(entry: SelectionEntry, report: Report) -> SelectionEntry:
+    if not entry.harness_targets or entry.proven:
+        return entry
+    remaining = [t for t in entry.targets if t not in set(entry.harness_targets)]
+    if not remaining:
+        return entry
+    report.warnings.append(
+        f"{len(entry.harness_targets)} auto-discovery harness module(s) were dropped from the "
+        f"selection for {entry.source_file}: collecting them with the fixture's name found no "
+        f"case that reads it, so running them whole would widen the run without proving anything"
+    )
+    return SelectionEntry(
+        entry.source_file,
+        remaining,
+        entry.method.replace("+harness", ""),
+        entry.detail,
+        entry.proof,
+        [],
+    )
 
 
 def _prove_fixture_entry(
@@ -933,10 +1010,21 @@ def _decide(report: Report) -> Report:
         report.localized = False
         return _decide_stage1(report)
 
-    ungated = [h for h in results if h.outcome is Outcome.PASS]
+    ungated = [h for h in results if h.status == "ungated"]
     assert_gated = [h for h in results if h.outcome is Outcome.ASSERT_FAIL]
     build_gated = [h for h in results if h.outcome is Outcome.BUILD_ERROR]
-    broken = [h for h in results if h.outcome in (Outcome.TIMEOUT, Outcome.RUNNER_ERROR, Outcome.NO_TESTS_RUN)]
+    # Not "gated by something we could not name" - not evaluated at all. These
+    # are excluded from every count below, so no claim of detection can rest on
+    # a hunk whose reverted run merely broke the runner.
+    broken = [h for h in results if not h.evaluable]
+    evaluated = [h for h in results if h.evaluable]
+    unknown_note = (
+        f" {len(broken)} further change(s) could not be evaluated because reverting them made "
+        f"the runner itself fail ({broken[0].summary}); they are listed in the report and are "
+        f"not counted as detected."
+        if broken
+        else ""
+    )
 
     n_tests = report.head_run.passed if report.head_run else 0
 
@@ -945,22 +1033,24 @@ def _decide(report: Report) -> Report:
         names = "; ".join(h.label for h in ungated[:3])
         more = f" (+{len(ungated) - 3} more)" if len(ungated) > 3 else ""
         report.headline = (
-            f"{len(ungated)} of {len(results)} behavioural change(s) in this PR can be reverted "
-            f"with all {n_tests} of its tests still passing: {names}{more}. "
-            f"This PR's tests would pass without that change."
+            f"{len(ungated)} of {len(evaluated)} evaluated behavioural change(s) in this PR can "
+            f"be reverted with all {n_tests} of its tests still passing: {names}{more}. "
+            f"This PR's tests would pass without that change.{unknown_note}"
         )
     elif assert_gated:
         report.verdict = Verdict.GATE_HOLDS
         report.headline = (
-            f"Every one of the {len(results)} behavioural change(s) in this PR is detected by its "
-            f"own tests ({len(assert_gated)} by an assertion, {len(build_gated)} at import time)."
+            f"Every one of the {len(evaluated)} evaluated behavioural change(s) in this PR is "
+            f"detected by its own tests ({len(assert_gated)} by an assertion, "
+            f"{len(build_gated)} at import time).{unknown_note}"
         )
     elif build_gated:
         report.verdict = Verdict.GATE_HOLDS_BUILD
         report.headline = (
-            f"All {len(build_gated)} behavioural change(s) are detected only because reverting "
-            f"them stops the tests building/importing. No assertion was ever exercised, so the "
-            f"tests gate the presence of the new code, not its behaviour."
+            f"All {len(build_gated)} evaluated behavioural change(s) are detected only because "
+            f"reverting them stops the tests building/importing. No assertion was ever "
+            f"exercised, so the tests gate the presence of the new code, not its "
+            f"behaviour.{unknown_note}"
         )
     elif broken:
         report.verdict = Verdict.INCONCLUSIVE

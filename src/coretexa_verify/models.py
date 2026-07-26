@@ -90,6 +90,17 @@ class TestRunResult:
     def command_str(self) -> str:
         return " ".join(_shquote(c) for c in self.command)
 
+    @property
+    def executed(self) -> int:
+        """Tests that actually ran a body. A skip is not evidence of anything.
+
+        pytest exits 0 when 100% of the selected tests skip, so ``PASS`` with
+        ``passed == 0`` is a real and common shape (an optional dependency, a
+        platform guard, an absent service). A verdict drawn from a run with
+        ``executed == 0`` would be backed by zero executed assertions.
+        """
+        return self.passed + self.failed + self.errored
+
     def summary(self) -> str:
         if self.outcome is Outcome.TIMEOUT:
             return f"timed out after {self.timeout_s}s"
@@ -145,6 +156,12 @@ class SelectionEntry:
         return bool(self.proof)
 
 
+#: Per-hunk outcomes that establish nothing either way. A runner usage error
+#: (pytest exit 4, no JUnit report), a timeout, or an empty collection tells us
+#: the experiment did not happen - not that the hunk is gated.
+UNEVALUABLE_OUTCOMES = (Outcome.RUNNER_ERROR, Outcome.TIMEOUT, Outcome.NO_TESTS_RUN)
+
+
 @dataclass
 class HunkResult:
     """One hunk reverted on its own, and what the PR's tests made of it."""
@@ -158,6 +175,22 @@ class HunkResult:
     summary: str
     preview: str = ""
     failing_ids: list[str] = field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        """``gated`` | ``ungated`` | ``unknown``.
+
+        ``unknown`` is the important one: reverting the hunk made the *runner*
+        fail, so no test ever expressed an opinion. Reporting that as "gated"
+        would let a broken command masquerade as a passing safety net.
+        """
+        if self.outcome in UNEVALUABLE_OUTCOMES:
+            return "unknown"
+        return "gated" if self.gated else "ungated"
+
+    @property
+    def evaluable(self) -> bool:
+        return self.status != "unknown"
 
 
 @dataclass
@@ -245,6 +278,7 @@ class Report:
             d["outcome"] = r.outcome.value
             d["command_str"] = r.command_str
             d["summary"] = r.summary()
+            d["executed"] = r.executed
             return d
 
         return {
@@ -286,7 +320,8 @@ class Report:
             "build_artifact_risk": self.build_artifact_risk,
             "localized": self.localized,
             "hunk_results": [
-                {**dataclasses.asdict(h), "outcome": h.outcome.value} for h in self.hunk_results
+                {**dataclasses.asdict(h), "outcome": h.outcome.value, "status": h.status}
+                for h in self.hunk_results
             ],
             "inert_hunks": self.inert_hunks,
             "warnings": self.warnings,
