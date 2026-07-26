@@ -14,6 +14,13 @@ VERDICT_BLURB: dict[Verdict, str] = {
     Verdict.INCONCLUSIVE: "No verdict could be established.",
 }
 
+_HUNK_MARK = {
+    "gated": "GATED    ",
+    "ungated": "UNGATED  ",
+    "unknown": "UNKNOWN  ",
+    "unreachable": "UNREACHED",
+}
+
 _MARK = {
     Verdict.NO_GATE: "!!",
     Verdict.GATE_HOLDS: "ok",
@@ -70,6 +77,17 @@ def render_text(report: Report, color: bool = False) -> str:
         lines.append(f"workspace : tests run from {report.workspace_package}/")
     if report.build_artifact_risk:
         lines.append(_wrap(f"artefacts : {report.build_artifact_risk}", w, subsequent="            "))
+    if report.redacted_env:
+        names = report.redacted_env
+        shown = ", ".join(names[:6]) + (f" (+{len(names) - 6} more)" if len(names) > 6 else "")
+        lines.append(
+            _wrap(
+                f"secrets   : {len(names)} environment variable(s) withheld from every "
+                f"subprocess that runs this repository's code: {shown}",
+                w,
+                subsequent="            ",
+            )
+        )
 
     if report.changed_files:
         lines.append("")
@@ -94,7 +112,11 @@ def render_text(report: Report, color: bool = False) -> str:
             )
 
     for label, run in (
-        ("run at head", report.head_run),
+        ("run at head", report.prior_head_run),
+        ("re-run of those failures at the merge base (source+tests at base)",
+         report.base_recheck_run),
+        ("run at head" if report.prior_head_run is None
+         else "run at head, pre-existing failures excluded", report.head_run),
         ("run with source reverted", report.reverted_run),
         ("run with only the fixture reverted (probe)", report.probe_run),
     ):
@@ -116,20 +138,33 @@ def render_text(report: Report, color: bool = False) -> str:
     if report.probe_note:
         lines.append("")
         lines.append(_wrap(f"fixture probe: {report.probe_note}", w, subsequent="  "))
+    if report.pre_existing_note:
+        lines.append("")
+        lines.append(_wrap(f"pre-existing: {report.pre_existing_note}", w, subsequent="  "))
 
     if report.hunk_results:
         lines.append("")
         lines.append("per-hunk localisation (each hunk reverted on its own)")
         for h in report.hunk_results:
-            mark = {"gated": "GATED    ", "ungated": "UNGATED  ", "unknown": "UNKNOWN  "}[h.status]
+            mark = _HUNK_MARK[h.status]
             lines.append(f"  {mark} {h.label}")
             lines.append(f"            {h.outcome.value}: {h.summary}")
+            if h.renames_applied:
+                pairs = ", ".join(f"{o} -> {n}" for o, n in sorted(h.renames_applied.items()))
+                lines.append(f"            rename kept applied: {pairs}")
+            if h.group:
+                lines.append(f"            co-reverted with: {', '.join(h.group)}")
             for fid in h.failing_ids[:3]:
                 lines.append(f"            -> {fid}")
     if report.inert_hunks:
         lines.append("")
         lines.append("hunks excluded as behaviourally inert")
         for note in report.inert_hunks:
+            lines.append(f"  {note}")
+    if report.unreachable_hunks:
+        lines.append("")
+        lines.append("hunks outside the reach of the detected test runner")
+        for note in report.unreachable_hunks:
             lines.append(f"  {note}")
 
     if report.reverted_files:
@@ -192,6 +227,11 @@ def render_markdown(report: Report) -> str:
         )
     if report.workspace_package:
         out.append(f"| workspace package | `{report.workspace_package}` |")
+    if report.redacted_env:
+        out.append(
+            f"| secrets withheld | {len(report.redacted_env)} environment variable(s) removed "
+            f"from every subprocess running this repository's code |"
+        )
     if report.test_targets:
         out.append(f"| tests run | {', '.join(f'`{t}`' for t in report.test_targets)} |")
     if report.reverted_files:
@@ -202,7 +242,11 @@ def render_markdown(report: Report) -> str:
         out.append("<details><summary>Runs</summary>")
         out.append("")
         for label, run in (
-            ("At head", report.head_run),
+            ("At head", report.prior_head_run),
+            ("Those failures re-run at the merge base (source **and** tests at base)",
+             report.base_recheck_run),
+            ("At head" if report.prior_head_run is None
+             else "At head, with the pre-existing failures excluded", report.head_run),
             ("With source reverted to base", report.reverted_run),
             ("With only the fixture reverted (mapping probe)", report.probe_run),
         ):
@@ -227,10 +271,13 @@ def render_markdown(report: Report) -> str:
     if report.hunk_results:
         ungated = [h for h in report.hunk_results if h.status == "ungated"]
         unknown = [h for h in report.hunk_results if h.status == "unknown"]
+        out_of_reach = [h for h in report.hunk_results if h.status == "unreachable"]
+        reachable = [h for h in report.hunk_results if h.reachable]
         extra = f", {len(unknown)} not evaluable" if unknown else ""
+        extra += f", {len(out_of_reach)} out of the runner's reach" if out_of_reach else ""
         out.append(
             f"<details{' open' if ungated else ''}><summary>Per-hunk localisation "
-            f"({len(ungated)} of {len(report.hunk_results)} behavioural change(s) ungated"
+            f"({len(ungated)} of {len(reachable)} reachable behavioural change(s) ungated"
             f"{extra})</summary>"
         )
         out.append("")
@@ -240,9 +287,18 @@ def render_markdown(report: Report) -> str:
             "ungated": "🚨 **not detected**",
             "gated": "detected",
             "unknown": "❔ **not evaluated** (the runner itself failed)",
+            "unreachable": "➖ _not run_ (no test this runner executes reaches this file)",
         }
         for h in report.hunk_results:
-            out.append(f"| `{h.label}` | {flags[h.status]} | {h.outcome.value}: {h.summary} |")
+            note = ""
+            if h.group:
+                note = f" — co-reverted with {', '.join(f'`{g}`' for g in h.group)}"
+            elif h.renames_applied:
+                pairs = ", ".join(f"{o}→{n}" for o, n in sorted(h.renames_applied.items()))
+                note = f" — rename `{pairs}` kept applied"
+            out.append(
+                f"| `{h.label}` | {flags[h.status]} | {h.outcome.value}: {h.summary}{note} |"
+            )
         if ungated:
             out.append("")
             for h in ungated:

@@ -38,6 +38,11 @@ class Outcome(str, enum.Enum):
     NO_TESTS_RUN = "NO_TESTS_RUN"
     TIMEOUT = "TIMEOUT"
     RUNNER_ERROR = "RUNNER_ERROR"
+    #: The experiment was never attempted for this hunk, because no test the
+    #: detected runner executes can reach the file it lives in. Distinct from
+    #: every outcome above: those record something we ran, this records
+    #: something we deliberately did not.
+    NOT_RUN = "NOT_RUN"
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.value
@@ -185,22 +190,44 @@ class HunkResult:
     summary: str
     preview: str = ""
     failing_ids: list[str] = field(default_factory=list)
+    #: Non-empty when this hunk could not be reverted alone and was reverted
+    #: together with the hunks named here - an identifier rename and the change
+    #: that consumes it. The result then gates the *group*, not this hunk.
+    group: list[str] = field(default_factory=list)
+    #: Identifier renames re-applied to the reverted text so the file still
+    #: compiles: ``{"OldName": "NewName"}``. See :mod:`coretexa_verify.hunks`.
+    renames_applied: dict = field(default_factory=dict)
+    #: Why no test the detected runner executes can reach this file. Non-empty
+    #: means the hunk was never run and is excluded from every count.
+    unreachable_reason: str = ""
 
     @property
     def status(self) -> str:
-        """``gated`` | ``ungated`` | ``unknown``.
+        """``gated`` | ``ungated`` | ``unknown`` | ``unreachable``.
 
         ``unknown`` is the important one: reverting the hunk made the *runner*
         fail, so no test ever expressed an opinion. Reporting that as "gated"
         would let a broken command masquerade as a passing safety net.
+
+        ``unreachable`` is the quieter one: the hunk was never reverted at all,
+        because the file it lives in is a frontend asset or a dependency
+        manifest that no test this runner executes can observe. Counting such a
+        hunk as "ungated" was how a NO_GATE headline came to say "19 of 34
+        behavioural changes" when 15 of the 34 were .vue files.
         """
+        if self.unreachable_reason or self.outcome is Outcome.NOT_RUN:
+            return "unreachable"
         if self.outcome in UNEVALUABLE_OUTCOMES:
             return "unknown"
         return "gated" if self.gated else "ungated"
 
     @property
     def evaluable(self) -> bool:
-        return self.status != "unknown"
+        return self.status not in ("unknown", "unreachable")
+
+    @property
+    def reachable(self) -> bool:
+        return self.status != "unreachable"
 
 
 @dataclass
@@ -258,6 +285,15 @@ class Report:
     #: The Defect-1 targeted probe: the fixture reverted alone, source intact.
     probe_run: TestRunResult | None = None
     probe_note: str = ""
+    #: The *first* head run, kept when it failed and the failures turned out to
+    #: pre-date the PR. :attr:`head_run` is then the re-run that excludes them.
+    prior_head_run: TestRunResult | None = None
+    #: The failing tests re-run with source *and* tests at the merge base.
+    base_recheck_run: TestRunResult | None = None
+    #: Test ids that failed at head and fail identically at the merge base.
+    pre_existing_failures: list[str] = field(default_factory=list)
+    #: How the pre-existing failures were established, for the report.
+    pre_existing_note: str = ""
     reverted_files: list[str] = field(default_factory=list)
     #: Build step re-run around every mutation, when one was detected.
     build: BuildInfo | None = None
@@ -265,8 +301,15 @@ class Report:
     workspace_package: str = ""
     #: Non-empty when test results may be served by stale build output.
     build_artifact_risk: str = ""
+    #: Names (never values) of environment variables withheld from every
+    #: subprocess that executes repository-controlled code.
+    redacted_env: list[str] = field(default_factory=list)
     hunk_results: list[HunkResult] = field(default_factory=list)
     inert_hunks: list[str] = field(default_factory=list)
+    #: Hunks skipped because no test the detected runner executes can reach the
+    #: file they live in (frontend assets, dependency manifests). Reported
+    #: separately from the behavioural count rather than diluting it.
+    unreachable_hunks: list[str] = field(default_factory=list)
     localized: bool = False
     warnings: list[str] = field(default_factory=list)
     tree_restored: bool = True
@@ -335,15 +378,21 @@ class Report:
             "reverted_run": run(self.reverted_run),
             "probe_run": run(self.probe_run),
             "probe_note": self.probe_note,
+            "prior_head_run": run(self.prior_head_run),
+            "base_recheck_run": run(self.base_recheck_run),
+            "pre_existing_failures": self.pre_existing_failures,
+            "pre_existing_note": self.pre_existing_note,
             "build": self.build.to_dict() if self.build is not None else None,
             "workspace_package": self.workspace_package,
             "build_artifact_risk": self.build_artifact_risk,
+            "redacted_env": self.redacted_env,
             "localized": self.localized,
             "hunk_results": [
                 {**dataclasses.asdict(h), "outcome": h.outcome.value, "status": h.status}
                 for h in self.hunk_results
             ],
             "inert_hunks": self.inert_hunks,
+            "unreachable_hunks": self.unreachable_hunks,
             "warnings": self.warnings,
             "tree_restored": self.tree_restored,
         }

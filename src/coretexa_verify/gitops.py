@@ -1,10 +1,23 @@
 """Thin, timeout-bounded wrapper around git, plus the revert/restore machinery.
 
-Two rules govern this module:
+Three rules govern this module:
 
 1. Every subprocess has a timeout and the timeout is reported, never swallowed.
 2. The user's working tree is put back exactly as we found it, on every path out
    of the function, including exceptions.
+3. **No subprocess that executes repository-controlled code inherits a secret.**
+
+Rule 3 is the one worth spelling out. This tool runs a pull request's own test
+suite, its own build step and its own dependency installer - all of which are
+code the PR author wrote - and it runs them inside a GitHub Action that may
+have been handed a token so it can post a comment. Passing ``os.environ``
+straight through would hand that token, and every other credential the job
+happens to hold, to the code under examination. ``run(..., isolate=True)``
+strips them first; see :func:`sanitized_environ`.
+
+The token is read exactly once, in :mod:`coretexa_verify.action_main`, *after*
+the experiment is over, out of that process's own environment - never out of a
+child's.
 """
 
 from __future__ import annotations
@@ -32,14 +45,108 @@ class CommandResult:
     timed_out: bool = False
 
 
+# --------------------------------------------------------------------------
+# secret isolation
+# --------------------------------------------------------------------------
+
+#: Names removed by exact match. These carry no ``TOKEN``-shaped suffix in
+#: every spelling a CI system uses, so listing them is the only reliable way.
+SECRET_ENV_NAMES = frozenset(
+    {
+        "INPUT_GITHUB_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "ACTIONS_RUNTIME_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "NPM_TOKEN",
+        "NODE_AUTH_TOKEN",
+        "TWINE_PASSWORD",
+        "CODECOV_TOKEN",
+        "SSH_AUTH_SOCK",
+        # Legacy spellings with no separator before the secret word, which the
+        # pattern below deliberately requires.
+        "PGPASSWORD",
+        "PGPASSFILE",
+        "MYSQL_PWD",
+        "NETRC",
+    }
+)
+
+#: Names removed by shape. Anchored at the end so ``TOKEN_URL`` survives while
+#: ``MY_SERVICE_TOKEN`` does not, and case-insensitive so lowercase spellings
+#: (``npm_token``) are caught too.
+SECRET_ENV_PATTERN = re.compile(
+    r"(?:^|_)(TOKEN|SECRET|SECRETS|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|CREDENTIALS|"
+    r"API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|PAT)$",
+    re.IGNORECASE,
+)
+
+#: Escape hatch, comma-separated. A repository whose test suite genuinely needs
+#: one of these (an integration test against a real service) can name it here
+#: and it will be passed through. Deliberately opt-in and per-name: there is no
+#: "disable isolation entirely" switch.
+ALLOWLIST_ENV_VAR = "CORETEXA_VERIFY_ALLOW_ENV"
+
+
+def allowlisted_env_names(base: "dict[str, str] | None" = None) -> frozenset:
+    """Names the user has explicitly asked us to keep, upper-cased."""
+    source = os.environ if base is None else base
+    raw = source.get(ALLOWLIST_ENV_VAR) or ""
+    return frozenset(part.strip() for part in raw.replace(";", ",").split(",") if part.strip())
+
+
+def is_secret_env_name(name: str, allowed: "frozenset | None" = None) -> bool:
+    """Would passing this variable to repository-controlled code leak a secret?"""
+    if allowed and name in allowed:
+        return False
+    if name in SECRET_ENV_NAMES:
+        return True
+    return bool(SECRET_ENV_PATTERN.search(name))
+
+
+def sanitized_environ(base: "dict[str, str] | None" = None) -> dict:
+    """A copy of the environment with every credential-shaped variable removed.
+
+    This is what every subprocess that executes repository-controlled code gets
+    - the dependency installer, the build step, the test run and the collection
+    pass. Everything else about the environment is preserved, because a test
+    suite legitimately depends on ``PATH``, ``HOME``, ``LANG``, ``CI``,
+    language-specific caches and so on; removing more than we must would break
+    real repositories for no security gain.
+    """
+    source = dict(os.environ if base is None else base)
+    allowed = allowlisted_env_names(source)
+    return {k: v for k, v in source.items() if not is_secret_env_name(k, allowed)}
+
+
+def redacted_env_names(base: "dict[str, str] | None" = None) -> list[str]:
+    """Which variables :func:`sanitized_environ` would drop. For the report."""
+    source = dict(os.environ if base is None else base)
+    allowed = allowlisted_env_names(source)
+    return sorted(k for k in source if is_secret_env_name(k, allowed))
+
+
 def run(
     argv: list[str],
     cwd: str,
     timeout: int = 120,
     env: dict[str, str] | None = None,
+    isolate: bool = False,
 ) -> CommandResult:
-    """Run a command, never raising on non-zero exit; timeouts are data, not exceptions."""
-    full_env = dict(os.environ)
+    """Run a command, never raising on non-zero exit; timeouts are data, not exceptions.
+
+    ``isolate=True`` means "this command is repository-controlled": it gets
+    :func:`sanitized_environ` as its base instead of ``os.environ``, so no
+    token or credential in the job's environment can reach it. Every call site
+    that runs a test suite, a build, an installer or a collection sets it. git
+    itself does not, because git is ours and may legitimately need the job's
+    credentials to fetch a base ref from a private repository.
+    """
+    full_env = sanitized_environ() if isolate else dict(os.environ)
     if env:
         full_env.update(env)
     try:

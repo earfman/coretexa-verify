@@ -177,6 +177,13 @@ def main() -> int:
     head_input = env("INPUT_HEAD_REF") or "HEAD"
     fail_on = env("INPUT_FAIL_ON", "never") or "never"
     timeout = int(env("INPUT_TIMEOUT", "900") or "900")
+    # Read here, in *our* process, and used only after the experiment is over
+    # (see the bottom of this function). It is never put into a child's
+    # environment: every subprocess that runs repository-controlled code - the
+    # dependency installer, the build step, the test runs, the collection pass -
+    # is launched through gitops.run(..., isolate=True), which strips this
+    # variable and every other credential-shaped one. os.environ itself is left
+    # untouched, which is why the line below still finds the token.
     token = env("INPUT_GITHUB_TOKEN")
     do_comment = env_bool("INPUT_COMMENT", True)
     localize = env("INPUT_LOCALIZE", "auto") or "auto"
@@ -184,6 +191,8 @@ def main() -> int:
     install_command = env("INPUT_INSTALL_COMMAND")
     install_timeout = int(env("INPUT_INSTALL_TIMEOUT", "600") or "600")
     max_collected = int(env("INPUT_MAX_COLLECTED", "500") or "500")
+    test_command = env("INPUT_TEST_COMMAND")
+    junit_path = env("INPUT_JUNIT_PATH")
 
     warnings: list[str] = []
     if not base_input:
@@ -208,6 +217,8 @@ def main() -> int:
             max_collected=max_collected,
             classifier=classifier,
             localize=localize,
+            test_command=test_command,
+            junit_path=junit_path,
             install_deps=install_deps,
             install_command=install_command,
             install_timeout=install_timeout,

@@ -93,6 +93,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-refine", action="store_true",
         help="run whole test files instead of narrowing to the tests this PR added",
     )
+    run.add_argument(
+        "--test-command", default="", metavar="CMD",
+        help=("explicit test command; overrides runner detection entirely and runs from the "
+              "repository root. Shell syntax (&&, pipes, globs) goes through /bin/sh -c, "
+              "anything simpler runs as argv. The selected test targets are substituted for "
+              "'{targets}' if present, otherwise appended"),
+    )
+    run.add_argument(
+        "--junit-path", default="", metavar="PATH",
+        help=("file or directory of JUnit XML that --test-command writes; without it results "
+              "are classified from the exit code alone and assert-vs-build is a declared "
+              "heuristic printed with every run"),
+    )
 
     dep = p.add_argument_group("dependency install")
     dep.add_argument(
@@ -181,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
             localize=args.localize,
             max_hunks=args.max_hunks,
             refine_selection=not args.no_refine,
+            test_command=args.test_command,
+            junit_path=args.junit_path,
             install_deps=args.install_deps,
             install_command=args.install_command,
             install_timeout=args.install_timeout,

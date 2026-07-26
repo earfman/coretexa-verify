@@ -63,10 +63,10 @@ from .models import (
     TestRunResult,
     Verdict,
 )
-from .runners import DetectionFailed, Runner, detect_runner
+from .runners import CommandRunner, DetectionFailed, Runner, detect_runner
 from .selection import classify_all, select_targets
 
-__version__ = "1.3.0"
+__version__ = "1.3.2"
 
 #: Reason attached to a verdict that had to be downgraded because a changed
 #: fixture could not be tied to a test that reads it. Quoted in the README.
@@ -95,6 +95,11 @@ class VerifyOptions:
     localize: str = LOCALIZE_AUTO
     max_hunks: int = 40
     refine_selection: bool = True
+    #: Explicit test command; overrides runner detection entirely when set.
+    test_command: str = ""
+    #: Where that command writes JUnit XML (file or directory). Without it the
+    #: custom runner falls back to exit-code-only classification.
+    junit_path: str = ""
     #: Detect and install the repository's own test dependencies before running.
     install_deps: bool = True
     #: Explicit install command; overrides detection entirely when set.
@@ -194,10 +199,24 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
     # NO_NEW_TESTS rather than becoming INCONCLUSIVE.
     runner: Runner | None = None
     detection_error = ""
-    try:
-        runner = detect_runner(repo, opts.extra_runner_args)
-    except DetectionFailed as exc:
-        detection_error = str(exc)
+    if opts.test_command.strip():
+        # An explicit command is not a hint that detection weighs up; it
+        # replaces detection. Nothing about the repository's layout is read.
+        runner = CommandRunner(
+            repo,
+            opts.test_command.strip(),
+            junit_path=opts.junit_path.strip(),
+            extra_args=opts.extra_runner_args,
+        )
+    else:
+        try:
+            runner = detect_runner(repo, opts.extra_runner_args)
+        except DetectionFailed as exc:
+            detection_error = str(exc)
+
+    # Names only, never values. Printed so a reader can confirm for themselves
+    # which credentials were withheld from the code we were about to execute.
+    report.redacted_env = gitops.redacted_env_names()
 
     if runner is not None:
         _demote_unrunnable_tests(report, runner)
@@ -293,8 +312,14 @@ def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
     report.test_targets = targets
 
     if not targets:
-        return _inconclusive(
-            report, "none of the PR's test changes could be mapped to a runnable test target"
+        if not runner.selection_optional:
+            return _inconclusive(
+                report, "none of the PR's test changes could be mapped to a runnable test target"
+            )
+        report.warnings.append(
+            "none of the PR's test changes could be mapped to an individual test target, so the "
+            "explicit test command was run exactly as given. Whatever it runs is what the "
+            "verdict covers - which is more than just this PR's own tests"
         )
     # --max-targets exists to stop us running a pile of whole files or whole
     # directories. A selection of individual node ids is the opposite of that -
@@ -352,7 +377,16 @@ def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
             head_run = runner.execute(targets, opts.timeout, report_dir, "head")
             report.head_run = head_run
             if head_run.outcome is not Outcome.PASS:
-                return _inconclusive(report, _head_failure_reason(head_run, report.install))
+                triaged = _triage_head_failures(
+                    repo, opts, report, base_sha, runner, targets, report_dir, baseline
+                )
+                if isinstance(triaged, str):
+                    return _inconclusive(
+                        report,
+                        triaged or _head_failure_reason(head_run, report.install),
+                    )
+                targets, head_run = triaged
+                report.test_targets = list(targets)
             if head_run.executed == 0:
                 return _inconclusive(report, _all_skipped_reason(head_run))
 
@@ -524,10 +558,23 @@ def _revert_source(repo, base_sha, head_sha, source, mutator, report) -> None:
         mutator.reverted.append(f.path)
 
 
+@dataclass
+class _HunkPlan:
+    """One hunk queued for an individual revert, with its file's context."""
+
+    path: str
+    hunk: object
+    head_text: str
+    #: ``{old: new}`` for every rename the *rest of this file* performs.
+    renames: dict = field(default_factory=dict)
+    #: The rename hunks those pairs came from, for the co-revert fallback.
+    rename_hunks: list = field(default_factory=list)
+
+
 def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir, baseline) -> None:
     """Revert one behavioural hunk at a time and record what the tests do."""
     report.localized = True
-    all_hunks: list[tuple[str, object, str]] = []  # (path, hunk, head_text)
+    plan: list[_HunkPlan] = []
     for f in source:
         if f.status in ("A", "D", "R"):
             # Whole-file add/delete/rename has no meaningful intermediate state.
@@ -535,9 +582,10 @@ def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir,
         head_text = hunkmod.read_head_text(repo, report.head_sha, f.path)
         if head_text is None:
             continue
-        behavioural, inert = hunkmod.behavioural_hunks(repo, base_sha, report.head_sha, f.path, head_text)
-        for hunk, why in inert:
+        split = hunkmod.split_file_hunks(repo, base_sha, report.head_sha, f.path, head_text)
+        for hunk, why in split.inert:
             report.inert_hunks.append(f"{hunk.short_label}: {why}")
+        behavioural = split.behavioural
         if f.has_inline_tests:
             # Localisation must not revert the PR's own tests any more than the
             # whole-file revert may. A hunk inside a #[cfg(test)] region is the
@@ -545,52 +593,331 @@ def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir,
             behavioural, held = inline_tests.classify_hunks(behavioural, f.inline_test_regions)
             for hunk, why in held:
                 report.inert_hunks.append(f"{hunk.short_label}: {why}")
-        for hunk in behavioural:
-            all_hunks.append((f.path, hunk, head_text))
 
-    if not all_hunks:
+        # A change no test can reach is not a behavioural change *for this
+        # suite*. Reverting it would prove nothing either way, and counting it
+        # would put frontend assets and lock files in the denominator of a
+        # NO_GATE headline that is supposed to be about covered code.
+        why_unreachable = runner.unreachable_reason(f.path)
+        if why_unreachable:
+            for hunk in behavioural:
+                report.unreachable_hunks.append(f"{hunk.short_label}: {why_unreachable}")
+                report.hunk_results.append(
+                    HunkResult(
+                        path=f.path,
+                        index=hunk.index,
+                        header=hunk.header,
+                        label=hunk.short_label,
+                        outcome=Outcome.NOT_RUN,
+                        gated=False,
+                        summary=f"not run - {why_unreachable}",
+                        preview=hunk.preview(),
+                        unreachable_reason=why_unreachable,
+                    )
+                )
+            continue
+
+        renames = split.renames
+        for hunk in behavioural:
+            plan.append(
+                _HunkPlan(
+                    path=f.path,
+                    hunk=hunk,
+                    head_text=head_text,
+                    renames=renames,
+                    rename_hunks=list(split.rename_only),
+                )
+            )
+
+    if not plan:
         report.warnings.append(
             "localisation found no behavioural hunks to revert individually "
-            "(the diff is comment/docstring-only, or the files were added or renamed wholesale)"
+            "(the diff is comment/docstring-only, an identifier rename, out of the detected "
+            "runner's reach, or the files were added or renamed wholesale)"
         )
         return
-    if len(all_hunks) > opts.max_hunks:
+    if len(plan) > opts.max_hunks:
         report.warnings.append(
-            f"localisation skipped: {len(all_hunks)} behavioural hunks exceeds the "
+            f"localisation skipped: {len(plan)} behavioural hunks exceeds the "
             f"--max-hunks limit of {opts.max_hunks}"
         )
         report.localized = False
         return
 
-    for i, (path, hunk, head_text) in enumerate(all_hunks):
-        try:
-            reverted_text = hunkmod.apply_reverse(head_text, hunk)
-        except ValueError as exc:
-            report.warnings.append(f"could not revert {hunk.short_label}: {exc}")
+    for i, item in enumerate(plan):
+        prepared = _prepare_sub_revert(item, report)
+        if prepared is None:
             continue
+        reverted_text, applied, group_labels = prepared
         mutator = gitops.TreeMutator(repo, base_sha)
         try:
             with mutator:
-                mutator.write(path, reverted_text.encode("utf-8"))
+                mutator.write(item.path, reverted_text.encode("utf-8"))
                 run = runner.execute(targets, opts.timeout, report_dir, f"hunk{i}")
         finally:
             _check_restored(repo, mutator, report, baseline)
         report.hunk_results.append(
             HunkResult(
-                path=path,
-                index=hunk.index,
-                header=hunk.header,
-                label=hunk.short_label,
+                path=item.path,
+                index=item.hunk.index,
+                header=item.hunk.header,
+                label=item.hunk.short_label,
                 outcome=run.outcome,
                 # A runner usage error, a timeout or an empty collection means
                 # the experiment did not happen. Calling that "gated" lets a
                 # broken command stand in for a test that noticed something.
                 gated=run.outcome in (Outcome.ASSERT_FAIL, Outcome.BUILD_ERROR),
                 summary=run.summary(),
-                preview=hunk.preview(),
+                preview=item.hunk.preview(),
                 failing_ids=(run.failing_ids + run.erroring_ids)[:5],
+                group=group_labels,
+                renames_applied=applied,
             )
         )
+
+
+def _prepare_sub_revert(item: _HunkPlan, report: Report):
+    """Build the file text for reverting one hunk *consistently*.
+
+    Returns ``(text, renames applied, co-reverted labels)`` or None.
+
+    A hunk that uses a symbol another hunk renamed cannot simply be rolled
+    back: the base text names a symbol that no longer exists and the file stops
+    compiling, which is how gatus #1719 came back BUILD_ERROR on both of its
+    hunks and was reported as a presence-only gate. So the rename is kept
+    applied and re-imposed on the reverted lines. When that would collide with
+    a symbol the reverted text already uses, the rename hunk is rolled back
+    alongside instead, and the result is labelled as gating the group.
+    """
+    deps = hunkmod.depends_on_renames(item.hunk, item.renames)
+    group: list = [item.hunk]
+    group_labels: list[str] = []
+    applied: dict = {}
+    if deps:
+        clean, why = hunkmod.rename_applies_cleanly(item.hunk.base_lines, deps)
+        if clean:
+            applied = dict(deps)
+        else:
+            for rename_hunk, mapping in item.rename_hunks:
+                if any(old in deps for old in mapping):
+                    group.append(rename_hunk)
+                    group_labels.append(rename_hunk.short_label)
+            report.warnings.append(
+                f"{item.hunk.short_label} depends on an identifier rename in the same file and "
+                f"the rename could not be re-applied to the reverted text ({why}), so it was "
+                f"reverted together with {', '.join(group_labels) or 'nothing else'}; the result "
+                f"gates that coupled group rather than either change alone"
+            )
+    try:
+        text = hunkmod.apply_reverse_many(item.head_text, group, applied)
+    except ValueError as exc:
+        report.warnings.append(f"could not revert {item.hunk.short_label}: {exc}")
+        return None
+    if applied:
+        pairs = ", ".join(f"{old} -> {new}" for old, new in sorted(applied.items()))
+        report.warnings.append(
+            f"{item.hunk.short_label} was reverted with the identifier rename {pairs} kept "
+            f"applied, so the file still compiles and the tests can express an opinion about "
+            f"the behaviour change rather than about a missing symbol"
+        )
+    return text, applied, group_labels
+
+
+# --------------------------------------------------------------------------
+# head failures: is this PR's fault, or was it already broken?
+# --------------------------------------------------------------------------
+
+
+def _triage_head_failures(
+    repo, opts, report, base_sha, runner, targets, report_dir, baseline
+):
+    """Decide whether a failing head run is this PR's doing or pre-dates it.
+
+    "The PR's tests do not pass at head" is a fair reason to refuse a verdict
+    only when the failure has something to do with the PR. superfile #1519 and
+    #1560 both died on ``TestZoxide``, which fails identically on a clean
+    ``origin/main`` because the machine has no ``zoxide`` binary - a fact about
+    the environment that says nothing about either PR.
+
+    So the failing tests are re-run with **source and tests both at the merge
+    base**. What comes back sorts them into three:
+
+    * failing at base too -> pre-existing. Excluded from the gate set and
+      reported as such; the experiment proceeds on what is left.
+    * passing at base -> this PR broke them. Still INCONCLUSIVE, and now we can
+      say why.
+    * not present at base -> the PR's own new tests are the ones failing.
+      Still INCONCLUSIVE, and that is a real finding about the PR, not a
+      limitation of ours.
+
+    Returns ``(targets, head run)`` to continue with, or a string reason to
+    stop. An empty string means "no triage was possible", and the caller falls
+    back to the ordinary head-failure explanation.
+    """
+    head_run = report.head_run
+    if head_run.outcome is not Outcome.ASSERT_FAIL or not head_run.failing_ids:
+        # A build error, a timeout, a runner error or an empty collection is
+        # not a set of named failing tests, so there is nothing to re-check.
+        return ""
+    if head_run.erroring_ids:
+        return ""
+    rerun = runner.rerun_targets(head_run.failing_ids, targets)
+    if not rerun:
+        report.warnings.append(
+            f"{len(head_run.failing_ids)} test(s) failed at head and the {runner.id} runner "
+            f"cannot re-run a named subset, so they could not be checked against the merge base"
+        )
+        return ""
+
+    based = _run_failures_at_base(repo, base_sha, runner, rerun, opts, report, report_dir, baseline)
+    if based is None:
+        return ""
+    base_run, base_collected = based
+    report.base_recheck_run = base_run
+    if base_run.outcome in (Outcome.TIMEOUT, Outcome.RUNNER_ERROR):
+        report.warnings.append(
+            f"the merge-base re-check of the failing tests did not produce a usable result "
+            f"({base_run.summary()}), so they could not be shown to pre-date this PR"
+        )
+        return ""
+
+    failing = _ordered_unique(runner.test_key(i) for i in head_run.failing_ids)
+    failed_at_base = {runner.test_key(i) for i in base_run.failing_ids + base_run.erroring_ids}
+    known_at_base = (
+        {runner.test_key(i) for i in base_collected} if base_collected is not None else None
+    )
+
+    pre_existing = [k for k in failing if k in failed_at_base]
+    new_tests = [
+        k
+        for k in failing
+        if k not in failed_at_base
+        and (
+            (known_at_base is not None and k not in known_at_base)
+            or (known_at_base is None and base_run.outcome is Outcome.NO_TESTS_RUN)
+        )
+    ]
+    regressed = [k for k in failing if k not in failed_at_base and k not in new_tests]
+
+    if new_tests:
+        return (
+            f"the PR's own new tests fail: {', '.join(new_tests[:5])}"
+            + (f" (+{len(new_tests) - 5} more)" if len(new_tests) > 5 else "")
+            + f". They do not exist at the merge base {base_sha[:12]}, so this is the PR's own "
+            f"evidence failing, not a pre-existing condition of the repository. "
+            + _base_head_failure_reason(head_run)
+        )
+    if regressed:
+        return (
+            f"{', '.join(regressed[:5])} fail at head but pass with this PR's source and tests "
+            f"reverted to the merge base {base_sha[:12]}, so the failure is this PR's doing and "
+            f"no experiment can be run on top of it. " + _base_head_failure_reason(head_run)
+        )
+    if not pre_existing:  # pragma: no cover - covered by the branches above
+        return ""
+
+    # Every head failure reproduces at base. Drop those tests and re-run.
+    collected = runner.collect(targets, min(opts.timeout, 300))
+    if collected is None:
+        return (
+            f"all {len(pre_existing)} failing test(s) fail identically at the merge base "
+            f"{base_sha[:12]} and so pre-date this PR, but the {runner.id} runner cannot "
+            f"enumerate the selection, so they could not be excluded from the gate set."
+        )
+    excluded = set(pre_existing)
+    remaining = [t for t in collected if runner.test_key(t) not in excluded]
+    if not remaining:
+        return (
+            f"every selected test fails identically at the merge base {base_sha[:12]}, so the "
+            f"whole selection is broken by something that pre-dates this PR "
+            f"({', '.join(pre_existing[:5])}) and nothing is left to run."
+        )
+    if len(remaining) > opts.max_collected:
+        return (
+            f"{len(pre_existing)} pre-existing failure(s) were excluded, leaving "
+            f"{len(remaining)} individual tests - over the --max-collected limit of "
+            f"{opts.max_collected}."
+        )
+
+    retry = runner.execute(remaining, opts.timeout, report_dir, "head-minus-pre-existing")
+    if retry.outcome is not Outcome.PASS:
+        return (
+            f"{len(pre_existing)} failing test(s) were shown to pre-date this PR "
+            f"({', '.join(pre_existing[:5])}) and excluded, but the remaining selection still "
+            f"does not pass at head. " + _base_head_failure_reason(retry)
+        )
+
+    report.prior_head_run = head_run
+    report.head_run = retry
+    report.pre_existing_failures = pre_existing
+    report.pre_existing_note = (
+        f"pre-existing failures ({len(pre_existing)}), excluded: {', '.join(pre_existing[:8])}"
+        + (f" (+{len(pre_existing) - 8} more)" if len(pre_existing) > 8 else "")
+        + f". Each fails identically with this PR's source *and* tests reverted to the merge "
+        f"base {base_sha[:12]}, so it is a property of the repository or the environment, not "
+        f"of this PR. The verdict rests on the remaining {retry.executed} test(s)."
+    )
+    report.warnings.append(report.pre_existing_note)
+    return remaining, retry
+
+
+def _run_failures_at_base(repo, base_sha, runner, rerun, opts, report, report_dir, baseline):
+    """Run ``rerun`` with every changed source *and* test file at the base.
+
+    Both halves have to move. Reverting only the source would leave the PR's
+    new test files in a tree that no longer has the code they import, and the
+    build failure that follows would tell us nothing about whether the failure
+    pre-dates the PR.
+    """
+    mutator = gitops.TreeMutator(repo, base_sha)
+    try:
+        with mutator:
+            mutator.revert(report.changed_files, kinds=(Kind.SOURCE, Kind.TEST))
+            if not mutator.reverted:
+                return None
+            collected = _collect_at_base(runner, rerun, min(opts.timeout, 300))
+            run = runner.execute(rerun, opts.timeout, report_dir, "base-recheck")
+            return run, collected
+    finally:
+        _check_restored(repo, mutator, report, baseline)
+
+
+def _collect_at_base(runner, rerun: list[str], timeout: int) -> list[str] | None:
+    """What of ``rerun`` exists at the base, enumerated one container at a time.
+
+    Enumerating the whole set in one call is no good here. A PR that *adds* a
+    package - superfile #1534 adds ``src/internal/ssh`` wholesale - makes that
+    call fail outright, the answer comes back "cannot enumerate", and a test
+    that never existed at base gets described as one this PR broke. Asking per
+    container (a Go package, a pytest file) lets the containers that do exist
+    answer for themselves, and the ones that do not simply contribute nothing -
+    which is exactly the fact we are trying to establish.
+    """
+    containers: list[str] = []
+    for target in rerun:
+        container = target.partition("::")[0]
+        if container not in containers:
+            containers.append(container)
+    known: list[str] = []
+    answered = False
+    for container in containers:
+        subset = [t for t in rerun if t.partition("::")[0] == container]
+        got = runner.collect(subset, timeout)
+        if got is None:
+            continue
+        answered = True
+        for nid in got:
+            if nid not in known:
+                known.append(nid)
+    return known if answered else None
+
+
+def _ordered_unique(items) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        if item and item not in out:
+            out.append(item)
+    return out
 
 
 def _check_restored(
@@ -649,6 +976,18 @@ def _skip_note(report: Report) -> str:
     )
 
 
+def _pre_existing_note(report: Report) -> str:
+    """A sentence naming the failures we excluded because they pre-date the PR."""
+    if not report.pre_existing_failures:
+        return ""
+    names = report.pre_existing_failures
+    return (
+        f" Pre-existing failures ({len(names)}), excluded: {', '.join(names[:5])}"
+        + (f" (+{len(names) - 5} more)" if len(names) > 5 else "")
+        + "; each fails identically at the merge base with this PR's source and tests reverted."
+    )
+
+
 def _unproven_fixture_entries(report: Report) -> list[SelectionEntry]:
     return [e for e in report.selection if e.targets and not e.proven]
 
@@ -676,7 +1015,7 @@ def _enforce_soundness(
         head = report.head_run
         if head is not None and head.executed == 0:
             return _inconclusive(report, _all_skipped_reason(head))
-        report.headline += _skip_note(report)
+        report.headline += _skip_note(report) + _pre_existing_note(report)
 
     if report.verdict is not Verdict.NO_GATE:
         return report
@@ -1109,22 +1448,73 @@ def _decide_stage1(report: Report) -> Report:
     return report
 
 
+#: Extensions that mean "a browser renders this", used only to give the
+#: unreachable-hunk note a phrase a human recognises.
+FRONTEND_EXTENSIONS = frozenset(
+    {
+        ".vue", ".svelte", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+        ".css", ".scss", ".sass", ".less", ".html", ".htm", ".json",
+        ".svg", ".png", ".ico", ".map", ".webmanifest",
+    }
+)
+
+
+def _unreachable_note(unreachable: list[HunkResult]) -> str:
+    """One sentence accounting for the hunks nothing could have exercised."""
+    if not unreachable:
+        return ""
+    manifests = [h for h in unreachable if "dependency manifest" in h.unreachable_reason]
+    rest = [h for h in unreachable if h not in manifests]
+    frontend = [h for h in rest if os.path.splitext(h.path)[1].lower() in FRONTEND_EXTENSIONS]
+    other = [h for h in rest if h not in frontend]
+    kinds: list[str] = []
+    if frontend:
+        exts = sorted({os.path.splitext(h.path)[1].lower() for h in frontend})
+        kinds.append(f"frontend assets ({', '.join(exts[:5])})")
+    if manifests:
+        names = sorted({os.path.basename(h.path) for h in manifests})
+        kinds.append(f"dependency manifests ({', '.join(names[:4])})")
+    if other:
+        exts = sorted({os.path.splitext(h.path)[1].lower() or os.path.basename(h.path) for h in other})
+        kinds.append(f"files the runner cannot execute ({', '.join(exts[:5])})")
+    return (
+        f" {len(unreachable)} further change(s) are outside the reach of the detected test "
+        f"runner ({'; '.join(kinds)}) and were not evaluated."
+    )
+
+
+def _rename_note(evaluated: list[HunkResult]) -> str:
+    renamed = [h for h in evaluated if h.renames_applied]
+    if not renamed:
+        return ""
+    pairs = sorted({f"{o} -> {n}" for h in renamed for o, n in h.renames_applied.items()})
+    return (
+        f" {len(renamed)} of them had to be reverted with the identifier rename(s) "
+        f"{', '.join(pairs[:3])} kept applied so the file still compiled."
+    )
+
+
 def _decide(report: Report) -> Report:
     """Verdict after localisation."""
     results = report.hunk_results
-    if not results:
-        # Localisation could not run; fall back to what stage 1 established.
+    reachable = [h for h in results if h.reachable]
+    unreachable = [h for h in results if not h.reachable]
+    if not reachable:
+        # Localisation could not run, or every hunk was out of reach; fall back
+        # to what stage 1 established rather than inventing a per-hunk claim.
         report.localized = False
-        return _decide_stage1(report)
+        report = _decide_stage1(report)
+        report.headline += _unreachable_note(unreachable)
+        return report
 
-    ungated = [h for h in results if h.status == "ungated"]
-    assert_gated = [h for h in results if h.outcome is Outcome.ASSERT_FAIL]
-    build_gated = [h for h in results if h.outcome is Outcome.BUILD_ERROR]
+    ungated = [h for h in reachable if h.status == "ungated"]
+    assert_gated = [h for h in reachable if h.outcome is Outcome.ASSERT_FAIL]
+    build_gated = [h for h in reachable if h.outcome is Outcome.BUILD_ERROR]
     # Not "gated by something we could not name" - not evaluated at all. These
     # are excluded from every count below, so no claim of detection can rest on
     # a hunk whose reverted run merely broke the runner.
-    broken = [h for h in results if not h.evaluable]
-    evaluated = [h for h in results if h.evaluable]
+    broken = [h for h in reachable if h.status == "unknown"]
+    evaluated = [h for h in reachable if h.evaluable]
     unknown_note = (
         f" {len(broken)} further change(s) could not be evaluated because reverting them made "
         f"the runner itself fail ({broken[0].summary}); they are listed in the report and are "
@@ -1132,6 +1522,7 @@ def _decide(report: Report) -> Report:
         if broken
         else ""
     )
+    out_of_reach = _unreachable_note(unreachable)
 
     n_tests = report.head_run.passed if report.head_run else 0
 
@@ -1142,23 +1533,38 @@ def _decide(report: Report) -> Report:
         report.headline = (
             f"{len(ungated)} of {len(evaluated)} evaluated behavioural change(s) in this PR can "
             f"be reverted with all {n_tests} of its tests still passing: {names}{more}. "
-            f"This PR's tests would pass without that change.{unknown_note}"
+            f"This PR's tests would pass without that change.{unknown_note}{out_of_reach}"
         )
     elif assert_gated:
         report.verdict = Verdict.GATE_HOLDS
         report.headline = (
             f"Every one of the {len(evaluated)} evaluated behavioural change(s) in this PR is "
             f"detected by its own tests ({len(assert_gated)} by an assertion, "
-            f"{len(build_gated)} at import time).{unknown_note}"
+            f"{len(build_gated)} at import time)."
+            f"{_rename_note(evaluated)}{unknown_note}{out_of_reach}"
         )
     elif build_gated:
         report.verdict = Verdict.GATE_HOLDS_BUILD
-        report.headline = (
-            f"All {len(build_gated)} evaluated behavioural change(s) are detected only because "
-            f"reverting them stops the tests building/importing. No assertion was ever "
-            f"exercised, so the tests gate the presence of the new code, not its "
-            f"behaviour.{unknown_note}"
-        )
+        coupled = [h for h in build_gated if h.group]
+        if coupled:
+            # Saying "presence, not behaviour" here would be a claim we did not
+            # earn: the group revert never isolated a behavioural change, so
+            # what the tests gate is the group.
+            report.headline = (
+                f"All {len(build_gated)} evaluated behavioural change(s) are detected only at "
+                f"build/import time, and {len(coupled)} of them could not be isolated: they "
+                f"depend on an identifier rename in the same file that could not be kept "
+                f"applied, so each was reverted together with that rename as a coupled group. "
+                f"The tests gate the group; no sub-revert isolated an assertion."
+                f"{unknown_note}{out_of_reach}"
+            )
+        else:
+            report.headline = (
+                f"All {len(build_gated)} evaluated behavioural change(s) are detected only "
+                f"because reverting them stops the tests building/importing. No assertion was "
+                f"ever exercised, so the tests gate the presence of the new code, not its "
+                f"behaviour.{unknown_note}{out_of_reach}"
+            )
     elif broken:
         report.verdict = Verdict.INCONCLUSIVE
         report.headline = (

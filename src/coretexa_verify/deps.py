@@ -730,7 +730,7 @@ def run_plan(repo: str, plan: InstallPlan, timeout: int) -> InstallReport:
     base_env = {"CI": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
     base_env.update(plan.env)
     for argv in plan.commands:
-        res = run(argv, cwd=repo, timeout=timeout, env=base_env)
+        res = run(argv, cwd=repo, timeout=timeout, env=base_env, isolate=True)
         rep.stdout_tail = _tail(res.stdout)
         rep.stderr_tail = _tail(res.stderr)
         if res.timed_out:
