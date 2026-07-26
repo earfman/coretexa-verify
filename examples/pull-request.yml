@@ -15,16 +15,25 @@ jobs:
         with:
           fetch-depth: 0            # required: we need the merge base
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # Install YOUR project's test dependencies exactly as your CI does.
-      # coretexa-verify runs your tests with the interpreter on PATH; it has
-      # no dependencies of its own.
-      - run: pip install -e ".[dev]"
-
       - uses: earfman/coretexa-verify@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # fail-on: no-gate     # uncomment to make NO_GATE block the merge
+          # fail-on: no-gate       # uncomment to make NO_GATE block the merge
+
+# That is the whole file. coretexa-verify detects and installs your project's
+# own declared test dependencies itself, and prints the command it chose and
+# the evidence for it.
+#
+# If you would rather install them yourself, add your own step and turn ours
+# off:
+#
+#       - run: pip install -e ".[dev]"
+#       - uses: earfman/coretexa-verify@v1
+#         with:
+#           install-deps: false
+#
+# Or keep ours in the sequence but tell it exactly what to run:
+#
+#       - uses: earfman/coretexa-verify@v1
+#         with:
+#           install-command: make test-deps
