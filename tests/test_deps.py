@@ -593,9 +593,12 @@ def test_a_tracked_file_the_install_rewrites_is_excluded_from_the_restore_check(
     assert report.tree_restored is True
     assert not any("still dirty after restoration" in w for w in report.warnings)
     assert any("modified tracked file(s) _version.py" in w for w in report.warnings)
-    # never reverted: the install's content is what survives
-    with open(os.path.join(project, "_version.py")) as fh:
-        assert fh.read().strip() == "VERSION = 'generated-by-install'"
+    # It survives for the duration of the run - the tests are run against what
+    # the install produced - but the checkout is handed back clean, because a
+    # tracked file left dirty makes the *next* run on this clone abort on the
+    # cleanliness gate. Found in the field on knadh/koanf: `go mod download`
+    # rewrites go.work.sum, and PRs 2, 3 and 4 of a sweep all died on it.
+    assert is_clean(project), "a second run would have been refused"
 
 
 def test_a_genuinely_dirty_tree_is_still_refused(project, tmp_path):
