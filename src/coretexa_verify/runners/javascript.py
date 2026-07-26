@@ -222,6 +222,16 @@ class JsWorkspaceMixin:
     def artifact_risk(self, targets: list[str], source_paths: list[str]) -> str:
         return javascript_artifact_risk(self.repo, targets, source_paths)
 
+    def detect_build_step(self, timeout: int) -> "BuildStep | None":
+        """JavaScript is the one language here with a *separate* build.
+
+        ``dist/`` outlives the source it was built from, so unless this step is
+        re-run inside every mutation the tests can read a build of code we just
+        reverted. Go, Rust and the JVM all recompile as part of running tests;
+        this does not.
+        """
+        return detect_build_step(self.repo, timeout=timeout)
+
 
 class JsonReportRunner(JsWorkspaceMixin, Runner):
     """Shared behaviour for jest and vitest."""

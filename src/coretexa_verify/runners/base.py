@@ -63,6 +63,15 @@ class Runner:
     language: str = "unknown"
     #: extension of the machine-readable report this runner writes
     report_suffix: str = "xml"
+    #: File extensions this runner can hand straight to its test command.
+    #:
+    #: A polyglot repository is the reason this exists. sqlfluff is a Python
+    #: project that vendors a Rust crate, so it contains
+    #: ``sqlfluffrs/tests/fixture_tests.rs`` - a perfectly real integration test
+    #: that pytest cannot run and must never be offered. Selection filters
+    #: candidate test files through this tuple, so a runner is never handed a
+    #: path it would choke on. An empty tuple means "no restriction".
+    test_file_extensions: tuple = ()
 
     def __init__(self, repo: str, reason: str, extra_args: list[str] | None = None):
         self.repo = repo
@@ -143,6 +152,45 @@ class Runner:
         Returns ``(rewritten targets, explanation)`` and mutates :attr:`cwd`, or
         None when the repository is not a workspace or the targets span more
         than one package.
+
+        Compiled languages also use this as the point where repo-relative *file
+        paths* (which is all selection knows how to produce) become the
+        runner's native unit of work - a Go package pattern, a cargo crate
+        spec. The rewrite is reported, so the user still sees the path they
+        changed next to the target it became.
+        """
+        return None
+
+    def narrow_from_diff(
+        self, repo: str, base_sha: str, head_sha: str, path: str, targets: list[str]
+    ) -> tuple[list[str], str, str] | None:
+        """Narrow ``targets`` to the individual tests this PR touched in ``path``.
+
+        Returns ``(targets, detail, proof)`` or None. Unlike the pytest path,
+        this does not require the runner to be able to enumerate tests first:
+        the names come from parsing the head file's own test declarations and
+        intersecting them with the diff, so they cannot be invented. If a name
+        somehow does not exist the run collects nothing and the verdict is
+        INCONCLUSIVE - the failure mode is closed, not open.
+        """
+        return None
+
+    def fixture_targets(self, fixture_path: str) -> tuple[list[str], str, str] | None:
+        """Map a changed fixture to its consumers *by language convention*.
+
+        Returns ``(targets, detail, proof)`` or None. This exists for the cases
+        where a toolchain guarantees the mapping - Go's ``testdata/``, Maven's
+        ``src/test/resources/`` - which is stronger evidence than the literal
+        grep in :mod:`coretexa_verify.selection` and is therefore tried first.
+        """
+        return None
+
+    def detect_build_step(self, timeout: int) -> "BuildStep | None":
+        """The repo's own build step, when tests consume its output.
+
+        Returning None must mean "no separate build is needed", not "we did not
+        look". For Go and Rust that is a statement about the toolchain rather
+        than a gap - see the comments in those modules.
         """
         return None
 

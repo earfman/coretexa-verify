@@ -12,9 +12,9 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import xml.etree.ElementTree as ET
 
 from ..models import Outcome, TestRunResult
+from . import junit
 from .base import DetectionContext, Runner
 
 # pytest exit codes
@@ -45,6 +45,7 @@ PYTEST_MARKERS = (
 class PytestRunner(Runner):
     id = "pytest"
     language = "python"
+    test_file_extensions = (".py",)
 
     def __init__(self, repo: str, reason: str, launcher: list[str], extra_args=None):
         super().__init__(repo, reason, extra_args)
@@ -104,33 +105,16 @@ def parse_pytest_report(
     report_path: str, exit_code: int, stdout: str = "", stderr: str = ""
 ) -> TestRunResult:
     """Turn a JUnit XML file + exit code into a :class:`TestRunResult`."""
-    counts = {"passed": 0, "failed": 0, "errored": 0, "skipped": 0}
-    failing: list[str] = []
-    erroring: list[str] = []
-    parsed_xml = False
+    # The XML reading is shared with the Maven/Gradle runner - see
+    # coretexa_verify.runners.junit. Only the exit-code interpretation below is
+    # pytest's own.
+    report = junit.read_reports([report_path])
+    counts = report.as_dict()
+    failing = report.failing
+    erroring = report.erroring
+    parsed_xml = report.parsed
 
-    if os.path.exists(report_path):
-        try:
-            root = ET.parse(report_path).getroot()
-            parsed_xml = True
-            suites = root.iter("testsuite") if root.tag != "testsuite" else [root]
-            for suite in suites:
-                for case in suite.iter("testcase"):
-                    name = _case_id(case)
-                    if case.find("error") is not None:
-                        counts["errored"] += 1
-                        erroring.append(name)
-                    elif case.find("failure") is not None:
-                        counts["failed"] += 1
-                        failing.append(name)
-                    elif case.find("skipped") is not None:
-                        counts["skipped"] += 1
-                    else:
-                        counts["passed"] += 1
-        except ET.ParseError:
-            parsed_xml = False
-
-    total = sum(counts.values())
+    total = report.total
 
     if not parsed_xml:
         # pytest died before it could write a report: usage error, missing
@@ -206,10 +190,8 @@ def parse_collect_only(stdout: str) -> list[str]:
     return ids
 
 
-def _case_id(case: ET.Element) -> str:
-    classname = case.get("classname") or ""
-    name = case.get("name") or "<unnamed>"
-    return f"{classname}::{name}" if classname else name
+#: Kept as an alias so existing imports of the private helper keep working.
+_case_id = junit.case_id
 
 
 # --------------------------------------------------------------------------
