@@ -105,10 +105,14 @@ class InstallPlan:
     evidence: str
     commands: list[list[str]]
     language: str = ""
+    #: Extra environment for this plan's commands. Used by the Go fallback,
+    #: whose only difference from the primary plan is ``GOFLAGS=-mod=mod``.
+    env: dict = field(default_factory=dict)
 
     @property
     def display(self) -> list[str]:
-        return [" ".join(shlex.quote(c) for c in cmd) for cmd in self.commands]
+        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(self.env.items()))
+        return [prefix + " ".join(shlex.quote(c) for c in cmd) for cmd in self.commands]
 
 
 @dataclass
@@ -490,6 +494,129 @@ def javascript_install_plans(repo: str) -> tuple[list[InstallPlan], str]:
     return plans, ""
 
 
+def go_install_plans(repo: str) -> tuple[list[InstallPlan], str]:
+    """``go mod download``, then the same thing with ``-mod=mod``.
+
+    The fallback exists for repositories whose committed ``go.sum`` is
+    incomplete or whose ``vendor/`` directory is stale: the default
+    ``-mod=readonly`` refuses to touch ``go.mod``, which is the right default,
+    but it turns a fixable environment into an unrunnable one. ``-mod=mod``
+    lets the go command write the missing entries. It *does* modify tracked
+    files, which the artefact snapshot in verify.py records and excludes from
+    the restoration check, so the change is visible rather than silent.
+    """
+    if not _exists(repo, "go.mod"):
+        return [], "no go.mod was found, so there was nothing to download"
+    if not shutil.which("go"):
+        return [], "go.mod is committed but `go` is not on PATH"
+    plans = [
+        InstallPlan(
+            detector="go:mod-download",
+            evidence="go.mod is committed and `go` is on PATH",
+            commands=[["go", "mod", "download"]],
+            language="go",
+        ),
+        InstallPlan(
+            detector="go:mod-download-mod",
+            evidence=(
+                "fallback: the read-only module download failed, so it was retried with "
+                "GOFLAGS=-mod=mod, which allows the go command to repair go.mod/go.sum"
+            ),
+            commands=[["go", "mod", "download"]],
+            language="go",
+            env={"GOFLAGS": "-mod=mod"},
+        ),
+    ]
+    return plans, ""
+
+
+def rust_install_plans(repo: str) -> tuple[list[InstallPlan], str]:
+    """``cargo fetch``: download the dependency graph, compile nothing.
+
+    Compilation is deliberately left to ``cargo test`` itself. Building here
+    would double the wall time of the first run for no benefit, and - more
+    importantly - it would produce artefacts *before* the mutation rather than
+    inside it, which is the exact confusion the build-artefact policy exists to
+    prevent.
+    """
+    if not _exists(repo, "Cargo.toml"):
+        return [], "no Cargo.toml was found, so there was nothing to fetch"
+    if not shutil.which("cargo"):
+        return [], "Cargo.toml is committed but `cargo` is not on PATH"
+    plans = [
+        InstallPlan(
+            detector="rust:cargo-fetch",
+            evidence=(
+                "Cargo.toml is committed and `cargo` is on PATH"
+                + ("; Cargo.lock is committed and is honoured" if _exists(repo, "Cargo.lock") else "")
+            ),
+            commands=[["cargo", "fetch"]],
+            language="rust",
+        )
+    ]
+    if _exists(repo, "Cargo.lock"):
+        plans.append(
+            InstallPlan(
+                detector="rust:cargo-fetch-unlocked",
+                evidence=(
+                    "fallback: the locked fetch failed, so it was retried without --locked "
+                    "semantics, which permits cargo to update Cargo.lock"
+                ),
+                commands=[["cargo", "fetch", "--manifest-path", "Cargo.toml"]],
+                language="rust",
+            )
+        )
+    return plans, ""
+
+
+def java_install_plans(repo: str) -> tuple[list[InstallPlan], str]:
+    """Resolve the JVM dependency graph without running any test.
+
+    Both commands are offline-hostile by nature: they reach a remote repository
+    on first use. A failure here is reported like any other failed install -
+    the run continues and the precondition check decides whether the
+    environment was adequate anyway.
+    """
+    if _exists(repo, "pom.xml"):
+        if not shutil.which("mvn"):
+            return [], "pom.xml is committed but `mvn` is not on PATH"
+        return (
+            [
+                InstallPlan(
+                    detector="java:maven",
+                    evidence="pom.xml is committed and `mvn` is on PATH",
+                    commands=[["mvn", "-B", "-q", "-DskipTests", "test-compile"]],
+                    language="java",
+                ),
+                InstallPlan(
+                    detector="java:maven-resolve",
+                    evidence=(
+                        "fallback: test-compile failed, so only the dependency graph was resolved"
+                    ),
+                    commands=[["mvn", "-B", "-q", "dependency:resolve"]],
+                    language="java",
+                ),
+            ],
+            "",
+        )
+    if _exists(repo, "build.gradle") or _exists(repo, "build.gradle.kts"):
+        launcher = "./gradlew" if _exists(repo, "gradlew") else "gradle"
+        if launcher == "gradle" and not shutil.which("gradle"):
+            return [], "build.gradle is committed but there is no gradlew and no `gradle` on PATH"
+        return (
+            [
+                InstallPlan(
+                    detector="java:gradle",
+                    evidence=f"build.gradle(.kts) is committed and `{launcher}` is available",
+                    commands=[[launcher, "testClasses", "--console=plain"]],
+                    language="java",
+                )
+            ],
+            "",
+        )
+    return [], "no pom.xml or build.gradle was found, so there was nothing to resolve"
+
+
 def detect_install_chain(
     repo: str, language: str, python_exe: str
 ) -> tuple[list[InstallPlan], str]:
@@ -498,6 +625,12 @@ def detect_install_chain(
         return python_install_plans(repo, python_exe)
     if language == "javascript":
         return javascript_install_plans(repo)
+    if language == "go":
+        return go_install_plans(repo)
+    if language == "rust":
+        return rust_install_plans(repo)
+    if language == "java":
+        return java_install_plans(repo)
     return [], f"no dependency detection is implemented for the {language!r} runner"
 
 
@@ -554,7 +687,8 @@ def detect_install(repo: str, language: str, python_exe: str) -> tuple[InstallPl
         return detect_python_install(repo, python_exe)
     if language == "javascript":
         return detect_javascript_install(repo)
-    return None, f"no dependency detection is implemented for the {language!r} runner"
+    plans, note = detect_install_chain(repo, language, python_exe)
+    return (plans[0] if plans else None), note
 
 
 def parse_override(command: str) -> list[list[str]]:
@@ -593,8 +727,10 @@ def run_plan(repo: str, plan: InstallPlan, timeout: int) -> InstallReport:
         timeout_s=timeout,
     )
     started = time.monotonic()
+    base_env = {"CI": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+    base_env.update(plan.env)
     for argv in plan.commands:
-        res = run(argv, cwd=repo, timeout=timeout, env={"CI": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
+        res = run(argv, cwd=repo, timeout=timeout, env=base_env)
         rep.stdout_tail = _tail(res.stdout)
         rep.stderr_tail = _tail(res.stderr)
         if res.timed_out:

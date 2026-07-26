@@ -113,8 +113,18 @@ def parse_hunks(diff_text: str, path: str) -> list[Hunk]:
     return hunks
 
 
-def file_hunks(repo: str, base: str, head: str, path: str) -> list[Hunk]:
-    res = git(repo, "diff", base, head, "--", path)
+def file_hunks(repo: str, base: str, head: str, path: str, context: int | None = None) -> list[Hunk]:
+    """Hunks for one file. ``context`` overrides git's default of three lines.
+
+    Zero context is what :mod:`coretexa_verify.inline_tests` needs: it makes each
+    hunk hug the lines that actually changed, so a change next to a
+    ``#[cfg(test)]`` block does not get glued to it by shared context lines.
+    """
+    args = ["diff"]
+    if context is not None:
+        args.append(f"--unified={context}")
+    args += [base, head, "--", path]
+    res = git(repo, *args)
     if res.returncode != 0:
         return []
     return parse_hunks(res.stdout, path)

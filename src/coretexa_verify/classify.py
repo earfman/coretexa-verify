@@ -60,6 +60,17 @@ DEFAULT_EXECUTABLE_TEST_PATTERNS: tuple[str, ...] = (
     "*Test.ts",
     "*Spec.js",
     "*Spec.ts",
+    # Go: the toolchain itself only compiles tests from *_test.go, so this is a
+    # rule rather than a convention.
+    "*_test.go",
+    # JVM: Surefire's default includes.
+    "*Test.java",
+    "*Tests.java",
+    "*TestCase.java",
+    "*IT.java",
+    "*Test.kt",
+    "*Tests.kt",
+    "*Spec.kt",
 )
 
 # --- documentation / metadata ------------------------------------------------
@@ -86,8 +97,14 @@ DEFAULT_OTHER_PATTERNS: tuple[str, ...] = (
 )
 DEFAULT_OTHER_DIR_PREFIXES: tuple[str, ...] = ("docs/", "doc/", ".github/")
 
+#: Extensions a file must have before its *name* is allowed to make it an
+#: executable test. This keeps ``test_data.json`` a fixture rather than a
+#: module, while letting ``foo_test.go`` and ``FooTest.java`` be modules.
 CODE_EXTENSIONS: frozenset[str] = frozenset(
-    {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+    {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+        ".go", ".rs", ".java", ".kt", ".scala", ".groovy",
+    }
 )
 
 
@@ -148,12 +165,32 @@ def matching_test_dir(path: str, cfg: ClassifierConfig | None = None) -> str | N
     return None
 
 
+def is_rust_integration_test(path: str) -> bool:
+    """``<crate>/tests/foo.rs`` - one file, one cargo test binary.
+
+    Cargo builds each ``.rs`` file sitting *directly* in a crate's ``tests/``
+    directory as its own integration-test binary. A file nested deeper
+    (``tests/common/mod.rs``) is a shared helper module, not a target, so it
+    must not be handed to ``--test``. fnmatch cannot express "exactly one path
+    component", hence the explicit check.
+    """
+    parts = _norm(path).split("/")
+    return (
+        len(parts) >= 2
+        and parts[-2] == "tests"
+        and parts[-1].endswith(".rs")
+        and parts[-1] != "mod.rs"
+    )
+
+
 def is_executable_test_name(path: str, cfg: ClassifierConfig | None = None) -> bool:
     """True when the file can be handed straight to the test runner."""
     cfg = cfg or ClassifierConfig()
     path = _norm(path)
     if posixpath.splitext(path)[1] not in CODE_EXTENSIONS:
         return False
+    if is_rust_integration_test(path):
+        return True
     return matches_any_glob(path, cfg.executable_test_patterns)
 
 

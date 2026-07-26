@@ -84,11 +84,28 @@ class SelectionError(Exception):
     """No runnable test target could be derived from the PR's test changes."""
 
 
-def list_executable_tests(repo: str, cfg: ClassifierConfig) -> list[str]:
+def list_executable_tests(
+    repo: str, cfg: ClassifierConfig, extensions: tuple | None = None
+) -> list[str]:
+    """Every committed file that is a runnable test module.
+
+    ``extensions`` is the detected runner's own list of file types it can
+    execute, and filtering by it is not cosmetic. sqlfluff is a Python project
+    that vendors a Rust crate; without the filter its
+    ``sqlfluffrs/tests/fixture_tests.rs`` joins the candidate pool, a literal
+    fixture search matches it, and pytest is handed a ``.rs`` file - which
+    collects nothing and turns a good verdict into INCONCLUSIVE.
+    """
     res = git(repo, "ls-files")
     if res.returncode != 0:
         return []
-    return [p for p in res.stdout.splitlines() if p and is_executable_test_name(p, cfg)]
+    return [
+        p
+        for p in res.stdout.splitlines()
+        if p
+        and is_executable_test_name(p, cfg)
+        and (not extensions or p.endswith(tuple(extensions)))
+    ]
 
 
 def candidate_tokens(path: str, cfg: ClassifierConfig) -> list[str]:
@@ -276,12 +293,14 @@ def select_targets(
     test_files: list[ChangedFile],
     cfg: ClassifierConfig,
     default_test_dir: str | None = None,
+    runner: object | None = None,
 ) -> tuple[list[str], list[SelectionEntry]]:
     """Map changed TEST files to runner targets.
 
     Returns the de-duplicated target list and a per-file audit trail.
     """
-    executable_tests = list_executable_tests(repo, cfg)
+    extensions = getattr(runner, "test_file_extensions", ()) or None
+    executable_tests = list_executable_tests(repo, cfg, extensions)
     entries: list[SelectionEntry] = []
     targets: list[str] = []
 
@@ -306,6 +325,23 @@ def select_targets(
                 )
             )
             add([f.path])
+            continue
+
+        # A language that *guarantees* which tests read a fixture beats any
+        # amount of grepping. Go's testdata/ and Maven's test resource root are
+        # both toolchain rules, so the runner is asked first and its answer is
+        # proof rather than a proposal.
+        by_convention = (
+            runner.fixture_targets(f.path) if runner is not None else None
+        )
+        if by_convention is not None:
+            conv_targets, conv_detail, conv_proof = by_convention
+            entries.append(
+                SelectionEntry(
+                    f.path, conv_targets, "fixture-convention", conv_detail, proof=conv_proof
+                )
+            )
+            add(conv_targets)
             continue
 
         consumers, why = find_consumers(repo, f.path, executable_tests, cfg)

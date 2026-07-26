@@ -62,6 +62,16 @@ class ChangedFile:
     reason: str
     old_path: str | None = None  # set for renames
     executable_test: bool = False
+    #: Head-side 1-based inclusive line ranges holding test code *inside* this
+    #: source file (Rust's ``#[cfg(test)] mod tests``). Non-empty means the file
+    #: is simultaneously SOURCE (revert it) and TEST (run it), and that the
+    #: revert must be done per hunk so the PR's own tests survive it. See
+    #: :mod:`coretexa_verify.inline_tests`.
+    inline_test_regions: list[tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def has_inline_tests(self) -> bool:
+        return bool(self.inline_test_regions)
 
 
 @dataclass
@@ -268,7 +278,16 @@ class Report:
 
     @property
     def test_files(self) -> list[ChangedFile]:
-        return [f for f in self.changed_files if f.kind is Kind.TEST]
+        """Files carrying the PR's evidence.
+
+        A source file with an inline ``#[cfg(test)]`` block appears here *and*
+        in :attr:`source_files`. It is genuinely both, and pretending otherwise
+        is what would make a Rust verdict meaningless.
+        """
+        return [
+            f for f in self.changed_files
+            if f.kind is Kind.TEST or f.has_inline_tests
+        ]
 
     def to_dict(self) -> dict[str, Any]:
         def run(r: TestRunResult | None) -> dict[str, Any] | None:
@@ -303,6 +322,7 @@ class Report:
                     "reason": f.reason,
                     "old_path": f.old_path,
                     "executable_test": f.executable_test,
+                    "inline_test_regions": [list(r) for r in f.inline_test_regions],
                 }
                 for f in self.changed_files
             ],

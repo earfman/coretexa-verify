@@ -51,7 +51,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 
-from . import deps as depsmod, gitops, hunks as hunkmod, refine
+from . import deps as depsmod, gitops, hunks as hunkmod, inline_tests, refine
 from .classify import ClassifierConfig
 from .models import (
     ChangedFile,
@@ -64,10 +64,9 @@ from .models import (
     Verdict,
 )
 from .runners import DetectionFailed, Runner, detect_runner
-from .runners.javascript import detect_build_step
 from .selection import classify_all, select_targets
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 #: Reason attached to a verdict that had to be downgraded because a changed
 #: fixture could not be tied to a test that reads it. Quoted in the README.
@@ -186,6 +185,28 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
         return _inconclusive(report, str(exc))
     report.changed_files = classify_all(raw, opts.classifier)
 
+    # Runner detection moves ahead of the source/test split, because in a
+    # compiled language that split can run *through* a file instead of between
+    # files - Rust's `#[cfg(test)] mod tests` makes one file both halves of the
+    # experiment - and only the runner's language says whether that applies
+    # here. The detection *failure* is still raised at exactly the point it
+    # always was, so a docs-only PR in an unrecognised repository still answers
+    # NO_NEW_TESTS rather than becoming INCONCLUSIVE.
+    runner: Runner | None = None
+    detection_error = ""
+    try:
+        runner = detect_runner(repo, opts.extra_runner_args)
+    except DetectionFailed as exc:
+        detection_error = str(exc)
+
+    if runner is not None:
+        _demote_unrunnable_tests(report, runner)
+        report.warnings.extend(
+            inline_tests.annotate(
+                repo, base_sha, report.head_sha, report.changed_files, runner.language
+            )
+        )
+
     source = report.source_files
     tests = report.test_files
     if not source and not tests:
@@ -201,10 +222,8 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
         )
         return report
 
-    try:
-        runner: Runner = detect_runner(repo, opts.extra_runner_args)
-    except DetectionFailed as exc:
-        return _inconclusive(report, str(exc))
+    if runner is None:
+        return _inconclusive(report, detection_error)
     report.runner = runner.info
     report.warnings.extend(runner.setup_warnings)
 
@@ -239,8 +258,32 @@ def _run_experiment(repo: str, opts: VerifyOptions, report: Report, base_sha: st
         runner.cleanup()
 
 
+def _demote_unrunnable_tests(report: Report, runner: Runner) -> None:
+    """A changed test file the detected runner cannot execute is not a target.
+
+    A polyglot repository has test files in more than one language. sqlfluff's
+    ``sqlfluffrs/tests/fixture_tests.rs`` is a genuine Rust integration test and
+    a genuine TEST file, but pytest cannot run it, and handing it over produces
+    a collection of zero and an INCONCLUSIVE that says nothing. It stays TEST -
+    it is still the PR's evidence and is still never reverted - it just stops
+    being something we try to *execute*.
+    """
+    extensions = tuple(runner.test_file_extensions or ())
+    if not extensions:
+        return
+    for f in report.changed_files:
+        if f.executable_test and not f.path.endswith(extensions):
+            f.executable_test = False
+            f.reason += (
+                f"; not runnable by the detected {runner.id} runner, which executes "
+                f"{', '.join(extensions)} files"
+            )
+
+
 def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline) -> Report:
-    targets, entries = select_targets(repo, tests, opts.classifier, runner.default_test_dir())
+    targets, entries = select_targets(
+        repo, tests, opts.classifier, runner.default_test_dir(), runner
+    )
     collected: list[str] | None = None
     if opts.refine_selection:
         targets, entries, collected = _refine(
@@ -291,7 +334,12 @@ def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
     focused = runner.focus(targets)
     if focused is not None:
         targets, why = focused
-        report.workspace_package = os.path.relpath(runner.cwd, repo).replace("\\", "/")
+        rel = os.path.relpath(runner.cwd, repo).replace("\\", "/")
+        # A runner may use focus() purely to rewrite file paths into its own
+        # unit of work (a Go package, a cargo crate) without moving anywhere.
+        # Reporting "." as the workspace package would be noise.
+        if rel not in ("", "."):
+            report.workspace_package = rel
         report.test_targets = targets
         report.warnings.append(why)
 
@@ -393,14 +441,21 @@ def _collection_cap(
 
 
 def _prepare_build(repo: str, opts: VerifyOptions, report: Report, runner: Runner) -> None:
-    """Detect the repo's build step and hand it to the runner.
+    """Ask the runner for the repo's build step and hand it back to it.
 
     From here on the runner re-runs it before *every* test run, so a reverted
     source file is always reflected in whatever the tests import.
+
+    This asks the *runner* rather than switching on a language name, so that
+    "no build step" is always a claim the runner made about its own toolchain
+    and can be read next to that toolchain's reasons. The three compiled
+    languages all return None, and all three say why in their module
+    docstrings: ``go test`` and ``cargo test`` compile from source on every
+    invocation, and ``mvn test``/``gradle test`` already depend on their own
+    compile task. None of them can serve a test from an artefact that predates
+    the mutation, which is the only thing this machinery exists to prevent.
     """
-    if runner.language != "javascript":
-        return
-    step = detect_build_step(repo, timeout=min(opts.timeout, 900))
+    step = runner.detect_build_step(min(opts.timeout, 900))
     if step is None:
         return
     runner.build_step = step
@@ -432,13 +487,41 @@ def _timed_revert_all(
     mutator = gitops.TreeMutator(repo, base_sha)
     try:
         with mutator:
-            mutator.revert(source)
+            _revert_source(repo, base_sha, report.head_sha, source, mutator, report)
             report.reverted_files = list(mutator.reverted)
             if not report.reverted_files:
                 return None
             return runner.execute(targets, opts.timeout, report_dir, "reverted")
     finally:
         _check_restored(repo, mutator, report, baseline)
+
+
+def _revert_source(repo, base_sha, head_sha, source, mutator, report) -> None:
+    """Put every source file back to base - except the PR's own inline tests.
+
+    A file with no inline test regions is reverted wholesale, exactly as it
+    always was. A file that carries a ``#[cfg(test)]`` block the PR touched is
+    reverted *hunk by hunk*, with the hunks inside those regions left at head,
+    so what runs is the base implementation carrying the PR's new tests. That
+    is the only state in which the experiment means anything for a language
+    whose tests live inside the file they test.
+    """
+    plain = [f for f in source if not f.has_inline_tests]
+    mutator.revert(plain)
+    for f in source:
+        if not f.has_inline_tests:
+            continue
+        head_text = hunkmod.read_head_text(repo, head_sha, f.path)
+        if head_text is None:  # pragma: no cover - defensive
+            continue
+        text, notes = inline_tests.revert_outside_regions(
+            repo, base_sha, head_sha, f.path, head_text, f.inline_test_regions
+        )
+        report.warnings.extend(notes)
+        if text is None:
+            continue
+        mutator.write(f.path, text.encode("utf-8"))
+        mutator.reverted.append(f.path)
 
 
 def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir, baseline) -> None:
@@ -455,6 +538,13 @@ def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir,
         behavioural, inert = hunkmod.behavioural_hunks(repo, base_sha, report.head_sha, f.path, head_text)
         for hunk, why in inert:
             report.inert_hunks.append(f"{hunk.short_label}: {why}")
+        if f.has_inline_tests:
+            # Localisation must not revert the PR's own tests any more than the
+            # whole-file revert may. A hunk inside a #[cfg(test)] region is the
+            # evidence, not the change under test.
+            behavioural, held = inline_tests.classify_hunks(behavioural, f.inline_test_regions)
+            for hunk, why in held:
+                report.inert_hunks.append(f"{hunk.short_label}: {why}")
         for hunk in behavioural:
             all_hunks.append((f.path, hunk, head_text))
 
@@ -809,10 +899,9 @@ def _refine(
     collected = runner.collect(targets, min(opts.timeout, 300))
     if collected is None:
         report.warnings.append(
-            f"the {runner.id} runner cannot enumerate tests, so the whole selected test "
-            f"file(s) were run rather than only the tests this PR added"
+            f"the {runner.id} runner could not enumerate tests for this selection, so "
+            f"refinement rests on what can be proved from the diff alone"
         )
-        return targets, entries, None
 
     by_file = {f.path: f for f in tests}
     new_targets: list[str] = []
@@ -830,21 +919,39 @@ def _refine(
         # a test file's AST do.
         validate = True
         if f is not None and f.executable_test and entry.targets:
-            changed = refine.changed_line_numbers(repo, base_sha, report.head_sha, f.path)
-            head_text = hunkmod.read_head_text(repo, report.head_sha, f.path)
-            if head_text and f.path.endswith(".py"):
-                proposal = refine.python_test_node_ids(head_text, f.path, changed)
-                if proposal:
-                    method = "direct+changed-tests"
-                    detail = f"only the {len(proposal)} test(s) this PR added or modified"
-        elif f is not None and not f.executable_test and entry.targets:
+            # A runner that can narrow straight from the diff gets first refusal.
+            # Its proposal needs no collection to validate it: the names are read
+            # out of the head file's own test declarations, so they cannot be
+            # invented, and a name that somehow does not exist makes the runner
+            # select nothing - which surfaces as NO_TESTS_RUN and INCONCLUSIVE,
+            # never as a silent pass.
+            narrowed = runner.narrow_from_diff(
+                repo, base_sha, report.head_sha, f.path, entry.targets
+            )
+            if narrowed is not None:
+                proposal, detail, proof = narrowed
+                method = entry.method + "+changed-tests"
+                validate = False
+            else:
+                changed = refine.changed_line_numbers(repo, base_sha, report.head_sha, f.path)
+                head_text = hunkmod.read_head_text(repo, report.head_sha, f.path)
+                if head_text and f.path.endswith(".py"):
+                    proposal = refine.python_test_node_ids(head_text, f.path, changed)
+                    if proposal:
+                        method = "direct+changed-tests"
+                        detail = f"only the {len(proposal)} test(s) this PR added or modified"
+        elif f is not None and not f.executable_test and entry.targets and collected is not None:
             proposal, method, detail, proof = _prove_fixture_entry(
                 repo, runner, opts, report, base_sha, f, entry, collected
             )
             validate = False
 
         if proposal:
-            kept = refine.verify_against_collection(proposal, collected) if validate else proposal
+            kept = (
+                refine.verify_against_collection(proposal, collected)
+                if validate and collected is not None
+                else proposal
+            )
             if kept:
                 new_entries.append(
                     SelectionEntry(
