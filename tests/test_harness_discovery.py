@@ -235,3 +235,129 @@ def test_verdict_degrades_rather_than_claiming_no_gate(autodiscovery_repo, monke
     assert UNPROVEN_FIXTURE_REASON in report.headline
     assert report.probe_run is not None, "the targeted probe must have been run"
     assert "unchanged" in report.probe_note
+
+
+# --------------------------------------------------------------------------
+# D2: the pathlib spelling of a fixture root
+# --------------------------------------------------------------------------
+
+PATHLIB_HARNESS = '''\
+"""Declares its fixture root the pathlib way, which 1.2.0 could not see."""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.transform import apply
+
+_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "test" / "fixtures" / "cases"
+CASES = sorted(_FIXTURE_DIR.glob("*.yml"))
+
+
+def _load(path):
+    data = {}
+    for line in path.read_text().splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            data[key.strip()] = value.strip()
+    return data
+
+
+@pytest.mark.parametrize("case", CASES, ids=[c.name for c in CASES])
+def test_case(case):
+    data = _load(case)
+    assert apply(data["input"]) == data["expected"]
+'''
+
+
+@pytest.fixture
+def pathlib_repo(tmp_path):
+    """Same defect shape as ``autodiscovery_repo``, pathlib-spelled root."""
+    root = str(tmp_path / "plib")
+    os.makedirs(root)
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.email", "t@example.com")
+    git(root, "config", "user.name", "t")
+
+    write(root, "pytest.ini", "[pytest]\n")
+    write(root, "src/__init__.py", "")
+    write(root, "src/transform.py", "def apply(value):\n    return value\n")
+    write(root, "test/fixtures/cases/gadget.yml", "input: AB\nexpected: AB\n")
+    write(root, "test/suite/all_cases_test.py", PATHLIB_HARNESS)
+    write(root, "test/suite/widget_test.py", DECOY)
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "base")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True
+    ).stdout.strip()
+
+    write(root, "src/transform.py", "def apply(value):\n    return value.upper()\n")
+    write(root, "test/fixtures/cases/widget.yml", "input: cd\nexpected: CD\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "head")
+    return root, base
+
+
+def test_directory_reference_forms_cover_the_pathlib_idiom():
+    forms = directory_reference_forms("test/fixtures/dialects")
+    assert '"test" / "fixtures" / "dialects"' in forms
+    assert "'test' / 'fixtures' / 'dialects'" in forms
+    assert '"test"/"fixtures"/"dialects"' in forms
+    assert "'test'/'fixtures'/'dialects'" in forms
+
+
+def test_harness_discovery_finds_a_pathlib_spelled_root(pathlib_repo):
+    repo, _ = pathlib_repo
+    cfg = ClassifierConfig()
+    tests = list_executable_tests(repo, cfg)
+    harness, why = find_harness_consumers(repo, "test/fixtures/cases/widget.yml", tests, cfg)
+    assert harness == ["test/suite/all_cases_test.py"]
+    assert "test/fixtures/cases" in why
+
+
+def test_pathlib_harness_reaches_a_true_verdict(pathlib_repo):
+    repo, base_sha = pathlib_repo
+    report = verify(
+        VerifyOptions(repo=repo, base=base_sha, head="HEAD", install_deps=False, timeout=120)
+    )
+    assert report.verdict is Verdict.GATE_HOLDS, report.headline
+    entry = next(e for e in report.selection if e.source_file == "test/fixtures/cases/widget.yml")
+    assert entry.proven
+
+
+def test_unnarrowed_harness_modules_are_dropped_from_the_selection(autodiscovery_repo):
+    """A harness that yields none of the fixture's cases is not worth running.
+
+    It would be a pile of whole modules chosen because they enumerate a
+    directory, not because they were shown to read this fixture.
+    """
+    from coretexa_verify.models import SelectionEntry
+    from coretexa_verify.verify import _prune_unnarrowed_harness
+
+    report = __import__("coretexa_verify.models", fromlist=["Report"]).Report(
+        Verdict.INCONCLUSIVE, ""
+    )
+    entry = SelectionEntry(
+        "test/fixtures/cases/widget.yml",
+        ["test/suite/widget_test.py", "test/suite/all_cases_test.py"],
+        "fixture-map+harness",
+        "",
+        proof="",
+        harness_targets=["test/suite/all_cases_test.py"],
+    )
+    pruned = _prune_unnarrowed_harness(entry, report)
+    assert pruned.targets == ["test/suite/widget_test.py"]
+    assert pruned.method == "fixture-map"
+    assert any("dropped from the selection" in w for w in report.warnings)
+
+
+def test_a_proven_harness_entry_is_never_pruned():
+    from coretexa_verify.models import Report, SelectionEntry
+    from coretexa_verify.verify import _prune_unnarrowed_harness
+
+    entry = SelectionEntry(
+        "f.yml", ["a.py", "h.py"], "fixture-map+harness", "", proof="named cases",
+        harness_targets=["h.py"],
+    )
+    assert _prune_unnarrowed_harness(entry, Report(Verdict.NO_GATE, "")).targets == ["a.py", "h.py"]

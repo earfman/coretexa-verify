@@ -483,3 +483,157 @@ def test_running_as_root_is_warned_about(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     report = verify(VerifyOptions(repo=root, base="main", head="HEAD", install_deps=False))
     assert not any("uid 0" in w for w in report.warnings)
+
+
+# --------------------------------------------------------------------------
+# D4: a runner usage error is not a gate
+# --------------------------------------------------------------------------
+
+
+def hunk(outcome, label="mod.py hunk 1"):
+    from coretexa_verify.models import HunkResult
+
+    return HunkResult(
+        path="mod.py", index=1, header="@@ -1 +1 @@", label=label,
+        outcome=outcome,
+        gated=outcome in (Outcome.ASSERT_FAIL, Outcome.BUILD_ERROR),
+        summary="s",
+    )
+
+
+def test_runner_error_hunk_is_unknown_not_gated():
+    h = hunk(Outcome.RUNNER_ERROR)
+    assert h.status == "unknown"
+    assert not h.evaluable
+    assert not h.gated
+
+
+def test_timeout_and_empty_collection_are_also_unknown():
+    assert hunk(Outcome.TIMEOUT).status == "unknown"
+    assert hunk(Outcome.NO_TESTS_RUN).status == "unknown"
+
+
+def test_assert_and_build_failures_are_still_gated():
+    assert hunk(Outcome.ASSERT_FAIL).status == "gated"
+    assert hunk(Outcome.BUILD_ERROR).status == "gated"
+    assert hunk(Outcome.PASS).status == "ungated"
+
+
+def test_gate_holds_claim_excludes_unevaluated_hunks():
+    """pytest exit 4 next to a real detection must not inflate the claim."""
+    from coretexa_verify.verify import _decide
+
+    report = Report(Verdict.INCONCLUSIVE, "")
+    report.head_run = TestRunResult(command=[], outcome=Outcome.PASS, passed=3, total=3)
+    report.hunk_results = [
+        hunk(Outcome.ASSERT_FAIL, "mod.py hunk 1"),
+        hunk(Outcome.RUNNER_ERROR, "mod.py hunk 2"),
+    ]
+    out = _decide(report)
+    assert out.verdict is Verdict.GATE_HOLDS
+    assert "Every one of the 1 evaluated behavioural change(s)" in out.headline
+    assert "1 further change(s) could not be evaluated" in out.headline
+    assert "not counted as detected" in out.headline
+
+
+def test_all_hunks_unevaluated_stays_inconclusive():
+    from coretexa_verify.verify import _decide
+
+    report = Report(Verdict.INCONCLUSIVE, "")
+    report.head_run = TestRunResult(command=[], outcome=Outcome.PASS, passed=3, total=3)
+    report.hunk_results = [hunk(Outcome.RUNNER_ERROR), hunk(Outcome.TIMEOUT)]
+    assert _decide(report).verdict is Verdict.INCONCLUSIVE
+
+
+def test_no_gate_counts_only_evaluated_hunks():
+    from coretexa_verify.verify import _decide
+
+    report = Report(Verdict.INCONCLUSIVE, "")
+    report.head_run = TestRunResult(command=[], outcome=Outcome.PASS, passed=3, total=3)
+    report.hunk_results = [
+        hunk(Outcome.PASS, "mod.py hunk 1"),
+        hunk(Outcome.ASSERT_FAIL, "mod.py hunk 2"),
+        hunk(Outcome.RUNNER_ERROR, "mod.py hunk 3"),
+    ]
+    out = _decide(report)
+    assert out.verdict is Verdict.NO_GATE
+    assert "1 of 2 evaluated behavioural change(s)" in out.headline
+
+
+def test_reports_render_unknown_hunks_distinctly():
+    from coretexa_verify.report import render_markdown, render_text, to_json
+
+    report = Report(Verdict.GATE_HOLDS, "h")
+    report.head_run = TestRunResult(command=[], outcome=Outcome.PASS, passed=1, total=1)
+    report.hunk_results = [hunk(Outcome.ASSERT_FAIL, "a"), hunk(Outcome.RUNNER_ERROR, "b")]
+    text = render_text(report)
+    assert "UNKNOWN  " in text
+    md = render_markdown(report)
+    assert "not evaluated" in md
+    assert "1 not evaluable" in md
+    assert '"status": "unknown"' in to_json(report)
+
+
+# --------------------------------------------------------------------------
+# D1: which interpreter are we actually about to install into
+# --------------------------------------------------------------------------
+
+
+def test_fallback_interpreter_is_named_and_warned_about(tmp_path):
+    import sys
+
+    from coretexa_verify.runners.base import DetectionContext
+    from coretexa_verify.runners.python import detect_python
+
+    write(tmp_path, "pyproject.toml", '[project]\nname = "x"\n')
+    runner = detect_python(DetectionContext(repo=str(tmp_path)))
+    assert runner.launcher == [sys.executable, "-m", "pytest"]
+    assert sys.executable in runner.reason, "the printed command must be the real one"
+    assert "`python -m pytest`" not in runner.reason
+    assert len(runner.setup_warnings) == 1
+    warning = runner.setup_warnings[0]
+    assert "no repository-local environment was found" in warning
+    assert sys.executable in warning
+    assert ".venv" in warning and "--no-install-deps" in warning
+
+
+def test_a_repo_local_venv_is_preferred_and_warns_about_nothing(tmp_path):
+    from coretexa_verify.runners.base import DetectionContext
+    from coretexa_verify.runners.python import detect_python
+
+    write(tmp_path, "pyproject.toml", '[project]\nname = "x"\n')
+    write(tmp_path, ".venv/bin/python", "#!/bin/sh\n")
+    runner = detect_python(DetectionContext(repo=str(tmp_path)))
+    assert runner.launcher == [os.path.join(str(tmp_path), ".venv", "bin", "python"), "-m", "pytest"]
+    assert runner.setup_warnings == []
+
+
+def test_setup_warnings_reach_the_report(tmp_path):
+    """The warning is useless if it never leaves the runner."""
+    import subprocess
+
+    from coretexa_verify.verify import verify
+
+    root = str(tmp_path / "r")
+    os.makedirs(root)
+    for args in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@e.com"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    write(root, "pyproject.toml", '[project]\nname = "x"\n')
+    write(root, "src.py", "X = 1\n")
+    write(root, "tests/a_test.py", "def test_a():\n    assert True\n")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True, capture_output=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True
+    ).stdout.strip()
+    write(root, "src.py", "X = 2\n")
+    write(root, "tests/a_test.py", "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "head"], cwd=root, check=True, capture_output=True)
+
+    report = verify(VerifyOptions(repo=root, base=base, head="HEAD", install_deps=False))
+    assert any("no repository-local environment was found" in w for w in report.warnings)
