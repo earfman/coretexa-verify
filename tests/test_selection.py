@@ -1,5 +1,7 @@
 """Fixture-to-consumer mapping and selection refinement."""
 
+import os
+
 from coretexa_verify.classify import ClassifierConfig
 from coretexa_verify.refine import (
     added_fixture_keys,
@@ -139,3 +141,59 @@ def test_verify_against_collection_accepts_parametrised_expansion():
 def test_added_fixture_keys_ignores_non_fixture_extensions(tmp_path):
     # Guard the extension check without needing a repo.
     assert added_fixture_keys(str(tmp_path), "a", "b", "src/module.py") == []
+
+
+# ==========================================================================
+# polyglot repositories: a runner may only be offered files it can run
+# ==========================================================================
+
+
+def test_only_test_files_the_runner_can_execute_enter_the_candidate_pool(tmp_path):
+    """sqlfluff is Python and vendors a Rust crate; pytest must not see the .rs.
+
+    Without this filter, `sqlfluffrs/tests/fixture_tests.rs` joins the pool, a
+    literal fixture search matches it, pytest is handed a `.rs` path, collection
+    returns nothing, and a real GATE_HOLDS becomes INCONCLUSIVE.
+    """
+    import subprocess
+
+    from coretexa_verify.selection import list_executable_tests
+
+    repo = str(tmp_path)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    for rel in (
+        "test/dialects/clickhouse_test.py",
+        "sqlfluffrs/tests/fixture_tests.rs",
+        "web/src/thing.test.ts",
+    ):
+        path = os.path.join(repo, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+
+    everything = list_executable_tests(repo, CFG)
+    assert set(everything) == {
+        "test/dialects/clickhouse_test.py",
+        "sqlfluffrs/tests/fixture_tests.rs",
+        "web/src/thing.test.ts",
+    }
+    assert list_executable_tests(repo, CFG, (".py",)) == ["test/dialects/clickhouse_test.py"]
+    assert list_executable_tests(repo, CFG, (".rs",)) == ["sqlfluffrs/tests/fixture_tests.rs"]
+
+
+def test_a_changed_test_file_the_runner_cannot_run_stops_being_a_target():
+    """It stays TEST - still evidence, still never reverted - but is not executed."""
+    from coretexa_verify.models import ChangedFile, Kind, Report, Verdict
+    from coretexa_verify.runners.python import PytestRunner
+    from coretexa_verify.verify import _demote_unrunnable_tests
+
+    report = Report(verdict=Verdict.INCONCLUSIVE, headline="")
+    report.changed_files = [
+        ChangedFile("t/a_test.py", "M", Kind.TEST, "r", executable_test=True),
+        ChangedFile("rs/tests/b.rs", "M", Kind.TEST, "r", executable_test=True),
+    ]
+    _demote_unrunnable_tests(report, PytestRunner("/repo", "x", ["python", "-m", "pytest"]))
+    assert report.changed_files[0].executable_test
+    assert not report.changed_files[1].executable_test
+    assert report.changed_files[1].kind is Kind.TEST
+    assert "not runnable by the detected pytest runner" in report.changed_files[1].reason

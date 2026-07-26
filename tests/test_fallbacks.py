@@ -637,3 +637,47 @@ def test_setup_warnings_reach_the_report(tmp_path):
 
     report = verify(VerifyOptions(repo=root, base=base, head="HEAD", install_deps=False))
     assert any("no repository-local environment was found" in w for w in report.warnings)
+
+
+def test_a_js_runner_exposes_the_build_step_through_the_runner_hook(monorepo, monkeypatch):
+    """verify.py asks the *runner* for a build step, not a hardcoded language.
+
+    JavaScript is the only registered language with a genuinely separate build:
+    `dist/` outlives the source it came from, so the step must be re-run inside
+    every mutation. Go, Rust and the JVM all recompile as part of running their
+    tests and say so by returning None. Keeping that as one polymorphic call
+    means "no build step" is always a claim some runner made about its own
+    toolchain.
+    """
+    from coretexa_verify.runners.javascript import VitestRunner
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    runner = VitestRunner(monorepo, reason="test")
+    step = runner.detect_build_step(900)
+    assert step is not None
+    assert step.argv == ["pnpm", "run", "build:all"]
+
+
+def test_prepare_build_installs_whatever_the_runner_returns(monorepo, monkeypatch):
+    from coretexa_verify.models import Report, Verdict
+    from coretexa_verify.runners.javascript import VitestRunner
+    from coretexa_verify.verify import VerifyOptions, _prepare_build
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    report = Report(verdict=Verdict.INCONCLUSIVE, headline="")
+    runner = VitestRunner(monorepo, reason="test")
+    _prepare_build(monorepo, VerifyOptions(repo=monorepo), report, runner)
+    assert runner.build_step is not None
+    assert report.build is not None
+    assert report.build.command == ["pnpm", "run", "build:all"]
+
+
+def test_prepare_build_records_nothing_for_a_runner_that_compiles_as_it_tests(tmp_path):
+    from coretexa_verify.models import Report, Verdict
+    from coretexa_verify.runners.golang import GoTestRunner
+    from coretexa_verify.verify import VerifyOptions, _prepare_build
+
+    report = Report(verdict=Verdict.INCONCLUSIVE, headline="")
+    runner = GoTestRunner(str(tmp_path), reason="test")
+    _prepare_build(str(tmp_path), VerifyOptions(repo=str(tmp_path)), report, runner)
+    assert runner.build_step is None and report.build is None

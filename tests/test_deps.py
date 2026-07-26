@@ -290,11 +290,20 @@ def test_detect_install_dispatches_on_the_runner_language(tmp_path, monkeypatch)
     write(tmp_path, "package.json", "{}")
     write(tmp_path, "pyproject.toml", "[project]\nname='x'\n")
     monkeypatch.setattr(deps.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    write(tmp_path, "go.mod", "module example.com/x\n\ngo 1.22\n")
+    write(tmp_path, "Cargo.toml", '[package]\nname = "x"\n')
     py, _ = detect_install(str(tmp_path), "python", PY)
     js, _ = detect_install(str(tmp_path), "javascript", PY)
+    go, _ = detect_install(str(tmp_path), "go", PY)
+    rs, _ = detect_install(str(tmp_path), "rust", PY)
     assert py.language == "python" and js.language == "javascript"
-    none, note = detect_install(str(tmp_path), "rust", PY)
-    assert none is None and "rust" in note
+    # Dispatch is on the *detected runner's* language, never on re-sniffing the
+    # repository: this tree looks like all four at once and each language still
+    # gets its own installer.
+    assert go.commands == [["go", "mod", "download"]]
+    assert rs.commands == [["cargo", "fetch"]]
+    none, note = detect_install(str(tmp_path), "haskell", PY)
+    assert none is None and "haskell" in note
 
 
 # ==========================================================================
