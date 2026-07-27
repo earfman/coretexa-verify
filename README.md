@@ -20,9 +20,13 @@ tests still passing: cmscontrib/loaders/italy_yaml.py hunk 2 (head lines
 ```
 
 - Runs entirely on **your** runner. We never execute your code on our infrastructure.
-- **Zero dependencies.** Pure Python standard library, so the Action installs nothing.
-- No telemetry, no analytics, no network access beyond git and (optionally) the
-  GitHub API with the token you hand it.
+- **No runtime dependencies of its own.** coretexa-verify is pure Python standard
+  library and installs nothing for itself. It does, by default, detect and install
+  *your* project's declared test dependencies (`pip`, `npm`, `go mod download`,
+  `cargo fetch`, …) on your runner — it has to, in order to run your tests. Turn
+  that off with `install-deps: false`.
+- No telemetry, no analytics, no network access beyond git, your package manager,
+  and (optionally) the GitHub API with the token you hand it.
 
 ---
 
@@ -37,8 +41,7 @@ name: coretexa-verify
 on: pull_request
 
 permissions:
-  contents: read
-  pull-requests: write   # only needed for the PR comment
+  contents: read          # read-only: nothing here can write to your repo
 
 jobs:
   verify:
@@ -46,12 +49,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0            # required: we need the merge base
+          fetch-depth: 0    # required: we need the merge base
 
+      - uses: earfman/coretexa-verify@v1
+```
+
+The verdict goes to the job summary and to the step outputs. No token, no write
+permission, nothing that can modify your repository — which is what you want on
+a public repo that accepts pull requests from forks.
+
+**Optional: post the verdict as a PR comment instead.** This needs write access
+to pull requests, so add it deliberately rather than by default:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write     # only for the comment
+
+# ...
       - uses: earfman/coretexa-verify@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # fail-on: no-gate     # uncomment to make NO_GATE block the merge
+          # fail-on: no-gate    # uncomment to make NO_GATE block the merge
 ```
 
 <details><summary>What changed in 1.1.0 — before and after</summary>
