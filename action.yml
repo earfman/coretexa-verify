@@ -1,8 +1,7 @@
 name: coretexa-verify
 description: >-
-  Mutation-tests a pull request's own diff: reverts only its source changes and
-  reports whether the PR's new tests actually notice. Runs entirely on your
-  runner.
+  Can this pull request's own new tests actually fail? Reverts the source,
+  keeps the tests, runs them again.
 author: coretexa
 branding:
   icon: shield
