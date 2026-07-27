@@ -19,6 +19,7 @@ _HUNK_MARK = {
     "ungated": "UNGATED  ",
     "unknown": "UNKNOWN  ",
     "unreachable": "UNREACHED",
+    "skipped": "SKIPPED  ",
 }
 
 _MARK = {
@@ -272,9 +273,11 @@ def render_markdown(report: Report) -> str:
         ungated = [h for h in report.hunk_results if h.status == "ungated"]
         unknown = [h for h in report.hunk_results if h.status == "unknown"]
         out_of_reach = [h for h in report.hunk_results if h.status == "unreachable"]
+        budget_skipped = [h for h in report.hunk_results if h.status == "skipped"]
         reachable = [h for h in report.hunk_results if h.reachable]
         extra = f", {len(unknown)} not evaluable" if unknown else ""
         extra += f", {len(out_of_reach)} out of the runner's reach" if out_of_reach else ""
+        extra += f", {len(budget_skipped)} skipped on the time budget" if budget_skipped else ""
         out.append(
             f"<details{' open' if ungated else ''}><summary>Per-hunk localisation "
             f"({len(ungated)} of {len(reachable)} reachable behavioural change(s) ungated"
@@ -288,6 +291,7 @@ def render_markdown(report: Report) -> str:
             "gated": "detected",
             "unknown": "❔ **not evaluated** (the runner itself failed)",
             "unreachable": "➖ _not run_ (no test this runner executes reaches this file)",
+            "skipped": "⏱ _not evaluated_ (localisation time budget reached — says nothing about this hunk)",
         }
         for h in report.hunk_results:
             note = ""

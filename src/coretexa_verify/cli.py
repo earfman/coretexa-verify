@@ -90,6 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip localisation if the diff has more behavioural hunks than this (default: 40)",
     )
     run.add_argument(
+        "--localize-budget", type=float, default=600.0, metavar="SECONDS",
+        help=(
+            "wall-clock seconds localisation may spend reverting hunks one at a time "
+            "(default: 600, 0 disables the limit). Hunks not reached are reported as "
+            "skipped, never as ungated."
+        ),
+    )
+    run.add_argument(
         "--no-refine", action="store_true",
         help="run whole test files instead of narrowing to the tests this PR added",
     )
@@ -192,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             max_targets=args.max_targets,
             max_collected=args.max_collected,
             localize=args.localize,
+            localize_budget=args.localize_budget,
             max_hunks=args.max_hunks,
             refine_selection=not args.no_refine,
             test_command=args.test_command,

@@ -200,6 +200,12 @@ class HunkResult:
     #: Why no test the detected runner executes can reach this file. Non-empty
     #: means the hunk was never run and is excluded from every count.
     unreachable_reason: str = ""
+    #: Why localisation stopped before reaching this hunk - a time or count
+    #: budget, not a property of the code. Kept distinct from
+    #: ``unreachable_reason`` because "we ran out of time" and "no test could
+    #: ever observe this" are different claims, and reporting the first as the
+    #: second would overstate what was established. Excluded from every count.
+    budget_skipped_reason: str = ""
 
     @property
     def status(self) -> str:
@@ -209,12 +215,19 @@ class HunkResult:
         fail, so no test ever expressed an opinion. Reporting that as "gated"
         would let a broken command masquerade as a passing safety net.
 
+        ``skipped`` means localisation ran out of its time budget before it
+        got here. Like ``unreachable`` it is excluded from every count, but it
+        says nothing about the code - only about how long we were willing to
+        spend.
+
         ``unreachable`` is the quieter one: the hunk was never reverted at all,
         because the file it lives in is a frontend asset or a dependency
         manifest that no test this runner executes can observe. Counting such a
         hunk as "ungated" was how a NO_GATE headline came to say "19 of 34
         behavioural changes" when 15 of the 34 were .vue files.
         """
+        if self.budget_skipped_reason:
+            return "skipped"
         if self.unreachable_reason or self.outcome is Outcome.NOT_RUN:
             return "unreachable"
         if self.outcome in UNEVALUABLE_OUTCOMES:
@@ -223,11 +236,11 @@ class HunkResult:
 
     @property
     def evaluable(self) -> bool:
-        return self.status not in ("unknown", "unreachable")
+        return self.status not in ("unknown", "unreachable", "skipped")
 
     @property
     def reachable(self) -> bool:
-        return self.status != "unreachable"
+        return self.status not in ("unreachable", "skipped")
 
 
 @dataclass

@@ -49,6 +49,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 from . import deps as depsmod, gitops, hunks as hunkmod, inline_tests, refine
@@ -66,7 +67,7 @@ from .models import (
 from .runners import CommandRunner, DetectionFailed, Runner, detect_runner
 from .selection import classify_all, select_targets
 
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 
 #: Reason attached to a verdict that had to be downgraded because a changed
 #: fixture could not be tied to a test that reads it. Quoted in the README.
@@ -94,6 +95,12 @@ class VerifyOptions:
     #: auto = localise only when the whole-PR revert merely broke the build.
     localize: str = LOCALIZE_AUTO
     max_hunks: int = 40
+    #: Wall-clock seconds localisation may spend reverting hunks one at a time.
+    #: Stage 1 is two test runs; stage 2 is one more per behavioural hunk, so a
+    #: large diff in a compiled language could previously cost 40+ full suite
+    #: runs on someone's CI with no ceiling but --max-hunks. Hunks not reached
+    #: before the budget expires are reported as skipped, never as ungated.
+    localize_budget: float = 600.0
     refine_selection: bool = True
     #: Explicit test command; overrides runner detection entirely when set.
     test_command: str = ""
@@ -683,7 +690,30 @@ def _localize(repo, base_sha, source, runner, targets, opts, report, report_dir,
         report.localized = False
         return
 
+    started = time.monotonic()
     for i, item in enumerate(plan):
+        if opts.localize_budget > 0 and time.monotonic() - started > opts.localize_budget:
+            remaining = plan[i:]
+            why = (
+                f"localisation stopped after {opts.localize_budget:.0f}s "
+                f"(--localize-budget); {len(remaining)} of {len(plan)} hunk(s) were not evaluated"
+            )
+            for skipped in remaining:
+                report.hunk_results.append(
+                    HunkResult(
+                        path=skipped.path,
+                        index=skipped.hunk.index,
+                        header=skipped.hunk.header,
+                        label=skipped.hunk.short_label,
+                        outcome=Outcome.NOT_RUN,
+                        gated=False,
+                        summary="not evaluated - localisation time budget reached",
+                        preview=skipped.hunk.preview(),
+                        budget_skipped_reason=why,
+                    )
+                )
+            report.warnings.append(why)
+            break
         prepared = _prepare_sub_revert(item, report)
         if prepared is None:
             continue
@@ -1499,8 +1529,25 @@ FRONTEND_EXTENSIONS = frozenset(
 )
 
 
+def _skipped_note(skipped: list[HunkResult]) -> str:
+    """One sentence for hunks we simply did not get to.
+
+    Kept separate from :func:`_unreachable_note` on purpose. Folding these into
+    "outside the reach of the detected test runner" would tell a maintainer
+    their perfectly testable ``.go`` files are unobservable, when the only true
+    statement is that we stopped early.
+    """
+    if not skipped:
+        return ""
+    return (
+        f" A further {len(skipped)} change(s) were not evaluated because localisation hit its "
+        f"time budget; that is a limit on this run, not a statement about those changes."
+    )
+
+
 def _unreachable_note(unreachable: list[HunkResult]) -> str:
     """One sentence accounting for the hunks nothing could have exercised."""
+    unreachable = [h for h in unreachable if not h.budget_skipped_reason]
     if not unreachable:
         return ""
     manifests = [h for h in unreachable if "dependency manifest" in h.unreachable_reason]
@@ -1545,6 +1592,7 @@ def _decide(report: Report) -> Report:
         report.localized = False
         report = _decide_stage1(report)
         report.headline += _unreachable_note(unreachable)
+        report.headline += _skipped_note([h for h in results if h.budget_skipped_reason])
         return report
 
     ungated = [h for h in reachable if h.status == "ungated"]
@@ -1563,6 +1611,7 @@ def _decide(report: Report) -> Report:
         else ""
     )
     out_of_reach = _unreachable_note(unreachable)
+    skipped_note = _skipped_note([h for h in results if h.budget_skipped_reason])
 
     n_tests = report.head_run.passed if report.head_run else 0
 
@@ -1573,7 +1622,7 @@ def _decide(report: Report) -> Report:
         report.headline = (
             f"{len(ungated)} of {len(evaluated)} evaluated behavioural change(s) in this PR can "
             f"be reverted with all {n_tests} of its tests still passing: {names}{more}. "
-            f"This PR's tests would pass without that change.{unknown_note}{out_of_reach}"
+            f"This PR's tests would pass without that change.{unknown_note}{out_of_reach}{skipped_note}"
         )
     elif assert_gated:
         report.verdict = Verdict.GATE_HOLDS
@@ -1581,7 +1630,7 @@ def _decide(report: Report) -> Report:
             f"Every one of the {len(evaluated)} evaluated behavioural change(s) in this PR is "
             f"detected by its own tests ({len(assert_gated)} by an assertion, "
             f"{len(build_gated)} at import time)."
-            f"{_rename_note(evaluated)}{unknown_note}{out_of_reach}"
+            f"{_rename_note(evaluated)}{unknown_note}{out_of_reach}{skipped_note}"
         )
     elif build_gated:
         report.verdict = Verdict.GATE_HOLDS_BUILD
@@ -1596,14 +1645,14 @@ def _decide(report: Report) -> Report:
                 f"depend on an identifier rename in the same file that could not be kept "
                 f"applied, so each was reverted together with that rename as a coupled group. "
                 f"The tests gate the group; no sub-revert isolated an assertion."
-                f"{unknown_note}{out_of_reach}"
+                f"{unknown_note}{out_of_reach}{skipped_note}"
             )
         else:
             report.headline = (
                 f"All {len(build_gated)} evaluated behavioural change(s) are detected only "
                 f"because reverting them stops the tests building/importing. No assertion was "
                 f"ever exercised, so the tests gate the presence of the new code, not its "
-                f"behaviour.{unknown_note}{out_of_reach}"
+                f"behaviour.{unknown_note}{out_of_reach}{skipped_note}"
             )
     elif broken:
         report.verdict = Verdict.INCONCLUSIVE

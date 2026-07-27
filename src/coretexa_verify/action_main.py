@@ -187,6 +187,7 @@ def main() -> int:
     token = env("INPUT_GITHUB_TOKEN")
     do_comment = env_bool("INPUT_COMMENT", True)
     localize = env("INPUT_LOCALIZE", "auto") or "auto"
+    localize_budget = float(env("INPUT_LOCALIZE_BUDGET", "600") or "600")
     install_deps = env_bool("INPUT_INSTALL_DEPS", True)
     install_command = env("INPUT_INSTALL_COMMAND")
     install_timeout = int(env("INPUT_INSTALL_TIMEOUT", "600") or "600")
@@ -217,6 +218,7 @@ def main() -> int:
             max_collected=max_collected,
             classifier=classifier,
             localize=localize,
+            localize_budget=localize_budget,
             test_command=test_command,
             junit_path=junit_path,
             install_deps=install_deps,
