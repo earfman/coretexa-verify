@@ -2,6 +2,24 @@
 
 All notable changes to coretexa-verify. Newest first.
 
+## 1.3.4
+
+### Changed
+
+- **Per-hunk localisation now has a wall-clock budget** (`--localize-budget`,
+  action input `localize-budget`, default 600s; `0` disables it). Stage 1 is
+  two test runs. Localisation adds one more per behavioural hunk and fires
+  whenever the whole-file revert fails to build - which in a compiled language
+  is the common case, not the rare one - so the only previous ceiling was
+  `--max-hunks` at 40. A large diff could mean 42 full suite runs on someone
+  else's CI. On a five-minute suite that is over three hours of billable
+  runner time to answer one question.
+- Hunks not reached before the budget expires are reported as **skipped**, a
+  status of their own. They are excluded from every count, exactly like
+  unreachable hunks, so they can never inflate a `NO_GATE` headline - but they
+  are labelled distinctly, because "we ran out of time" and "no test could ever
+  observe this" are different claims and only one of them is about your code.
+
 ## 1.3.3
 
 ### Fixed

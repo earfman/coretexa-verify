@@ -80,6 +80,14 @@ inputs:
       time; never reports only the whole-PR result.
     required: false
     default: "auto"
+  localize-budget:
+    description: >-
+      Wall-clock seconds per-hunk localisation may spend. Stage 1 is two test
+      runs; localisation adds one more per behavioural hunk, so a large diff in
+      a compiled language can be many full suite runs. Hunks not reached are
+      reported as skipped and never counted as ungated. 0 disables the limit.
+    required: false
+    default: "600"
   github-token:
     description: >-
       Token used to post/update a single PR comment. Omit it and no comment is
@@ -128,6 +136,7 @@ runs:
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_LOCALIZE: ${{ inputs.localize }}
+        INPUT_LOCALIZE_BUDGET: ${{ inputs.localize-budget }}
         INPUT_MAX_COLLECTED: ${{ inputs.max-collected }}
         INPUT_INSTALL_DEPS: ${{ inputs.install-deps }}
         INPUT_INSTALL_COMMAND: ${{ inputs.install-command }}
