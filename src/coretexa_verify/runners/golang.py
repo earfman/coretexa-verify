@@ -349,6 +349,62 @@ class GoTestRunner(Runner):
         """
         return ""
 
+    def coverage_gap(self, targets: list[str], source_paths: list[str]) -> str:
+        """Ask the toolchain whether the test packages import the changed ones.
+
+        Directory disjointness proves nothing on its own: a test in one package
+        may import another and exercise it perfectly well. ``go list -deps -test``
+        is the authoritative answer - it expands the full transitive dependency
+        closure of the test binaries, including their test-only imports.
+
+        Only a *positive* answer downgrades the verdict. If ``go list`` fails,
+        times out, or the paths cannot be mapped, this returns ``""`` and the
+        verdict stands unchanged.
+        """
+        changed = {package_dir(p) for p in source_paths if p.endswith(".go")}
+        changed.discard("")
+        if not changed:
+            return ""
+        test_pkgs = {package_dir(t.partition("::")[0]) for t in targets}
+        test_pkgs.discard("")
+        if not test_pkgs:
+            return ""
+        if changed & test_pkgs:
+            return ""
+
+        base = self.module.rstrip("/") + "/" if self.module else ""
+        rel_tests = sorted(t[len(base) :] if base and t.startswith(base) else t for t in test_pkgs)
+        argv = ["go", "list", "-deps", "-test", "-f", "{{.Dir}}", *("./" + p for p in rel_tests)]
+        try:
+            proc = run(
+                argv, cwd=self.cwd, timeout=120, env=self.child_environment(), isolate=True
+            )
+        except Exception:
+            return ""
+        if proc.timed_out or proc.returncode != 0:
+            return ""
+
+        reached = set()
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rel = os.path.relpath(line, self.repo).replace("\\", "/")
+            if not rel.startswith(".."):
+                reached.add(rel)
+        if not reached:
+            return ""
+        if changed & reached:
+            return ""
+
+        missed = ", ".join(sorted(changed))
+        where = ", ".join(rel_tests)
+        return (
+            f"the selected test package(s) ({where}) do not import {missed}: "
+            f"`go list -deps -test` puts the changed package outside their dependency "
+            f"closure, so no test that ran could observe the revert"
+        )
+
     # -- monorepo / path -> package ---------------------------------------
     def map_to_packages(self, targets: list[str]) -> tuple[str, list[str]] | None:
         """``(module root, ./package targets)`` for a list of file-path targets.

@@ -261,6 +261,29 @@ class Runner:
         """Why a stale build artefact could mask a source revert, or ``""``."""
         return ""
 
+    def coverage_gap(self, targets: list[str], source_paths: list[str]) -> str:
+        """Why these tests could not observe a revert of this source, or ``""``.
+
+        A `NO_GATE` says "the tests passed with the source reverted". That is
+        only a statement *about the tests* when the tests could have failed. If
+        the selected tests never load the changed code at all, the experiment
+        had no power, and reporting `NO_GATE` blames an author for a gap the
+        run never measured.
+
+        The defect this exists for: a pull request changed
+        ``src/pkg/file_preview/`` and, separately, one test in
+        ``src/internal/ui/prompt/``. Selection took the changed test - correctly,
+        it is the only one the PR touched - and the run then reverted a package
+        that test does not import. Both runs passed identically and the verdict
+        read "this PR's tests would pass without the fix."
+
+        Returning ``""`` means *no claim*, which is the default for every runner
+        that cannot prove non-coverage. Only positive proof should downgrade a
+        verdict, because guessing here would trade a false `NO_GATE` for a false
+        `INCONCLUSIVE` and lose real findings.
+        """
+        return ""
+
     # -- reachability ------------------------------------------------------
     def unreachable_reason(self, path: str) -> str:
         """Why no test this runner executes can observe a change to ``path``.
