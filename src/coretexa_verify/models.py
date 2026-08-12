@@ -314,6 +314,10 @@ class Report:
     workspace_package: str = ""
     #: Non-empty when test results may be served by stale build output.
     build_artifact_risk: str = ""
+    #: Non-empty when the selected tests provably cannot load the reverted
+    #: source, so a passing reverted run measured nothing. Downgrades what
+    #: would otherwise be a NO_GATE to INCONCLUSIVE.
+    coverage_gap: str = ""
     #: Names (never values) of environment variables withheld from every
     #: subprocess that executes repository-controlled code.
     redacted_env: list[str] = field(default_factory=list)
@@ -398,6 +402,7 @@ class Report:
             "build": self.build.to_dict() if self.build is not None else None,
             "workspace_package": self.workspace_package,
             "build_artifact_risk": self.build_artifact_risk,
+            "coverage_gap": self.coverage_gap,
             "redacted_env": self.redacted_env,
             "localized": self.localized,
             "hunk_results": [
