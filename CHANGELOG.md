@@ -2,6 +2,36 @@
 
 All notable changes to coretexa-verify. Newest first.
 
+## 1.3.5
+
+### Fixed
+
+- **A `NO_GATE` is no longer reported when the selected tests could not have
+  observed the revert.** Found by running the tool against live pull requests:
+  `yorukot/superfile#1619` changed `src/pkg/file_preview/` and, separately, one
+  test in `src/internal/ui/prompt/`. Selection took that test — correctly, it
+  was the only one the pull request touched — the run reverted a package the
+  test does not import, both runs passed identically, and the verdict read
+  *"this PR's tests would pass without the fix."* The experiment had no power,
+  and the headline blamed an author for a gap it never measured.
+
+  Runners may now implement `coverage_gap(targets, source_paths)`. The Go runner
+  answers it with `go list -deps -test`, which expands the full transitive
+  dependency closure of the test binaries including their test-only imports.
+  When the changed package falls outside that closure the verdict is
+  `INCONCLUSIVE`, naming the packages and the reason, instead of `NO_GATE`.
+
+  Directory disjointness deliberately does **not** decide this: a test in one
+  package may import another and exercise it perfectly well, and treating that
+  as a gap would silently discard true findings. Only a positive answer from the
+  toolchain downgrades a verdict — a `go list` that fails, times out or returns
+  nothing leaves the verdict exactly as it was, as does any runner that has not
+  implemented the hook. Python, JavaScript, Rust and Java are unchanged for now;
+  their import graphs need separate work.
+
+  Re-running the six superfile pull requests that exposed this: #1619 moves from
+  `NO_GATE` to `INCONCLUSIVE`, and the other five verdicts are unchanged.
+
 ## 1.3.4
 
 ### Changed
