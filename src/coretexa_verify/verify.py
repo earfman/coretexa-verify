@@ -67,7 +67,7 @@ from .models import (
 from .runners import CommandRunner, DetectionFailed, Runner, detect_runner
 from .selection import classify_all, select_targets
 
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 
 #: Reason attached to a verdict that had to be downgraded because a changed
 #: fixture could not be tied to a test that reads it. Quoted in the README.
@@ -400,6 +400,7 @@ def _run_selected(repo, opts, report, base_sha, runner, source, tests, baseline)
     # ---- build artefacts (computed on repo-relative paths) ----------------
     repo_targets = list(targets)
     report.build_artifact_risk = runner.artifact_risk(repo_targets, [f.path for f in source])
+    report.coverage_gap = runner.coverage_gap(repo_targets, [f.path for f in source])
 
     # ---- monorepo: run from the package that owns the tests ---------------
     focused = runner.focus(targets)
@@ -1484,6 +1485,17 @@ def _decide_stage1(report: Report) -> Report:
     n_tests = report.head_run.passed if report.head_run else 0
 
     if run.outcome is Outcome.PASS:
+        if report.coverage_gap:
+            # The tests passed with the source reverted, but they could never
+            # have done anything else: they do not load the reverted code. That
+            # is a statement about the experiment, not about the pull request.
+            report.verdict = Verdict.INCONCLUSIVE
+            report.headline = (
+                f"All {n_tests} of the PR's selected test(s) still pass with {reverted} reverted, "
+                f"but this run had no power to detect that revert: {report.coverage_gap}. "
+                f"No conclusion about this PR's tests is available."
+            )
+            return report
         report.verdict = Verdict.NO_GATE
         report.headline = (
             f"All {n_tests} of the PR's selected test(s) still pass with {reverted} reverted to "
